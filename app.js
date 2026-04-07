@@ -1,0 +1,2234 @@
+require('dotenv').config();
+const { Highrise, GatewayIntentBits, WebApi } = require('highrise.sdk');
+const fs = require('fs');
+const path = require('path');
+const connectDB = require('./db');
+const State = require('./models/State.model');
+const Room = require('./models/Room.model');
+
+// Bot Configuration
+const settings = {
+	token: process.env.BOT_TOKEN,
+	room: process.env.ROOM_ID,
+	reconnect: 5
+};
+
+// Optional: restrict owner-only commands. Set env var like `BOT_OWNER_IDS="id1,id2"`.
+// Or hardcode here for automatic setup
+const HARDCODED_OWNER_IDS = [
+	'6446fc09d86431b11043cb18'  // ZillaGram (room owner)
+];
+
+const PRISON_ROOMID = "69cd50fd435f294f643f66d8";
+
+const OWNER_USER_IDS = (process.env.BOT_OWNER_IDS || HARDCODED_OWNER_IDS.join(','))
+	.split(',')
+	.map((s) => s.trim())
+	.filter(Boolean);
+
+// Global in-memory state (cached from DB)
+let state = {};
+
+const DATA_FILE = path.join(__dirname, 'state.json');
+
+/**
+ * Fetches the global state from MongoDB.
+ * Falls back to migration from state.json if DB is empty.
+ */
+async function fetchState() {
+	try {
+		// 1. Try to find existing state in DB
+		let dbState = await State.findOne({ key: 'global_state' });
+
+		// 2. If not found in DB, check for local migration
+		if (!dbState) {
+			console.log('[STATE] No state found in DB. Checking for local state.json migration...');
+			let initialData = {
+				protectedUserIds: [],
+				vipUserIds: [],
+				fullControllerUserIds: [],
+				subscribers: [],
+				globalPrison: {},
+				waitingForInviteUser: null,
+				autoTeleEnabled: false,
+				lastGoodRoomId: null,
+				lastSourceConversationId: null,
+				vipPrice: 500,
+				vipDurationDays: 30,
+				walletTotal: 0,
+				vipSubscriptions: {},
+				usernameCache: {},
+				logs: { bans: [], kicks: [], mutes: [], punches: [], cuts: [], voids: [], freezes: [], unbans: [], slaps: [] }
+			};
+
+			if (fs.existsSync(DATA_FILE)) {
+				try {
+					const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+					console.log('[STATE] Found state.json! Migrating data to MongoDB...');
+					initialData = { ...initialData, ...saved };
+					
+					// Migrate rooms if they exist in state.json
+					if (saved.rooms) {
+						for (const [roomId, roomData] of Object.entries(saved.rooms)) {
+							await Room.findOneAndUpdate(
+								{ roomId },
+								{ ...roomData },
+								{ upsert: true, new: true }
+							);
+						}
+						console.log(`[STATE] Migrated ${Object.keys(saved.rooms).length} rooms to DB.`);
+					}
+				} catch (err) {
+					console.error('[STATE] Migration failed:', err.message);
+				}
+			}
+
+			// 3. Create initial DB document
+			dbState = await State.create({ ...initialData, key: 'global_state' });
+			console.log('[STATE] Initial state created in MongoDB.');
+		}
+
+		// Cache in memory
+		state = dbState.toObject();
+		return state;
+	} catch (e) {
+		console.error('[STATE] Critial error fetching state:', e);
+		process.exit(1);
+	}
+}
+
+/**
+ * Syncs the in-memory state back to MongoDB
+ */
+async function syncState() {
+	try {
+		await State.findOneAndUpdate(
+			{ key: 'global_state' },
+			{ $set: state },
+			{ upsert: true }
+		);
+	} catch (e) {
+		console.error('[STATE] Failed to sync state to DB:', e.message);
+	}
+}
+
+/**
+ * Helper to get room-specific state from MongoDB
+ */
+async function getRoomData(roomId) {
+	const id = roomId || process.env.ROOM_ID || 'default';
+	try {
+		let room = await Room.findOne({ roomId: id });
+		if (!room) {
+			room = await Room.create({
+				roomId: id,
+				teleportPoints: {},
+				spawnPos: null,
+				vipSpawnPos: null,
+				prison: {}
+			});
+		}
+		// Use flattenMaps to ensure Map types are converted to plain objects for bracket access
+		return room.toObject({ flattenMaps: true });
+	} catch (e) {
+		console.error(`[STATE] Failed to get room data for ${id}:`, e.message);
+		return { teleportPoints: {}, spawnPos: null, vipSpawnPos: null, prison: {} };
+	}
+}
+
+/**
+ * Helper to update room data in MongoDB
+ */
+async function syncRoomData(roomId, update) {
+	const id = roomId || process.env.ROOM_ID || 'default';
+	try {
+		await Room.findOneAndUpdate(
+			{ roomId: id },
+			{ $set: update },
+			{ upsert: true }
+		);
+	} catch (e) {
+		console.error(`[STATE] Failed to sync room data for ${id}:`, e.message);
+	}
+}
+
+const activePrisonTimers = new Map(); // userId -> NodeJS.Timeout
+
+// Dance party runtime state (not persisted)
+let activeDancePartyTimer = null;
+let activeDanceParty = { emoteId: null, userIds: [] };
+
+// Fun interaction messages
+const RIZZ_MESSAGES = [
+	"Are you a rainbow? Because you appear after my storms. 🌈",
+	"Do you have a charger? Because my phone is about to die, but you already took my breath away. 🔋",
+	"Are you a bank loan? Because you have my interest. 🏦",
+	"Is your name Wi-Fi? Because I'm feeling a really strong connection. 📶",
+	"If beauty were time, you’d be an eternity. ⏳",
+	"Do you have a sunburn or are you always this hot? ☀️",
+	"Are you a camera? Because every time I look at you, I smile. 📸",
+	"I’m not a genie, but I can make your dreams come true. 🧞‍♂️",
+	"Did it hurt? When you fell from heaven? ✨",
+	"If I were a cat, I’d spend all 9 lives with you. 🐱",
+	"Are you a magician? Because whenever I look at you, everyone else disappears. ✨",
+	"Is your name Google? Because you have everything I’m searching for. 🔍",
+	"Are you an interior decorator? Because when I saw you, the whole room became beautiful. 🏡",
+	"I’m not a photographer, but I can definitely picture us together. 📸",
+	"Are you a parking ticket? Because you've got FINE written all over you. 🎫"
+];
+
+const ROAST_MESSAGES = [
+	"I've seen more talent in a broken vending machine. 🥤",
+	"I'd agree with you but then we'd both be wrong. 🤡",
+	"You’re the reason shampoo has instructions. 🧴",
+	"If I had a face like yours, I’d sue my parents. 👨‍👩‍👧",
+	"You bring everyone so much joy... when you leave the room. 🚪",
+	"I’m not a proctologist, but I know an asshole when I see one. 🩺",
+	"You're like a cloud. When you disappear, it's a beautiful day. ☁️",
+	"I'd give you a nasty look but you've already got one. 👺",
+	"Your brain is like the 4th of July—all sparks and no light. 🎆",
+	"I would roast you, but my mom told me not to burn trash. 🗑️",
+	"Mirrors can't talk, and lucky for you they can't laugh either. 🪞",
+	"I’m not insulting you, I’m describing you. 💁‍♂️",
+	"You're living proof that even the best mistakes can be repeated. 📉",
+	"You have a face for radio and a voice for silent movies. 📻",
+	"If I wanted to kill myself, I'd climb your ego and jump to your IQ. 🏔️"
+];
+
+const AUTOTELE_THRESHOLD = 8.0;
+
+const WELCOME_TEMPLATE = 
+	"🌟 **Welcome to Exclusive Announcement!** 🌟\n\n" +
+	"🎉 **Thank you for subscribing!** 🎉\n\n" +
+	"✨ Stay tuned for automatic updates on our exciting events, giveaways, and exclusive invitations. Be the first to know whenever we're hosting something amazing!\n\n" +
+	"💬 *Disclaimer: Users who block the bot will be automatically unsubscribed from our notification system.*\n\n" +
+	"💖 **Happy connecting and exploring with us!**";
+
+const INVITE_MESSAGE = "✨ Our community offers a friendly and positive atmosphere! Join us!";
+
+// Create bot instance with common intents
+const bot = new Highrise(
+	{
+		intents: [
+			GatewayIntentBits.Ready,
+			GatewayIntentBits.Messages,
+			GatewayIntentBits.DirectMessages,
+			GatewayIntentBits.Joins,
+			GatewayIntentBits.Leaves,
+			GatewayIntentBits.Reactions,
+			GatewayIntentBits.Emotes,
+			GatewayIntentBits.Error,
+			GatewayIntentBits.Moderate,
+			GatewayIntentBits.Movements,
+			GatewayIntentBits.Tips
+		],
+		cache: true
+	},
+	settings.reconnect
+);
+
+// Minimal event hooks for visibility
+bot.on('ready', async (session) => {
+	console.log(`[READY] Bot connected. Session: ${session?.sessionId || 'unknown'}`);
+	// Cache the bot's user ID and room owner ID
+	try {
+		botUserId = session.user_id;
+		roomOwnerId = session.room_info.owner_id;
+		console.log(`[INFO] Bot ID cached: ${botUserId}`);
+		console.log(`[INFO] Room Owner ID: ${roomOwnerId}`);
+	} catch (e) {
+		console.warn('Could not cache IDs on ready:', e);
+	}
+
+	// Safety Checkpoint: This room is verified as working!
+	state.lastGoodRoomId = bot.roomId;
+	await syncState();
+
+	const roomState = await getRoomData(bot.roomId);
+	if (roomState.spawnPos && roomState.spawnPos.x !== undefined) {
+		setTimeout(async () => {
+			try {
+				await bot.move.walk(roomState.spawnPos.x, roomState.spawnState?.y ?? roomState.spawnPos.y, roomState.spawnPos.z, roomState.spawnPos.facing || 'FrontRight');
+				console.log('[INFO] Bot successfully walked to default spawnPos');
+			} catch (e) {
+				console.error('[ERROR] Failed to walk to spawnPos:', e);
+			}
+		}, 2500);
+	}
+});
+
+bot.on('chatCreate', async (user, message) => {
+	if (user?.id) state.usernameCache[user.id] = user.username;
+	console.log(`[CHAT] ${user?.username || user?.id}: ${message}`);
+	handleChatCommand(user, message, false);
+});
+
+bot.on('whisperCreate', async (user, message) => {
+	if (user?.id) state.usernameCache[user.id] = user.username;
+	console.log(`[DM] ${user?.username || user?.id}: ${message}`);
+	handleChatCommand(user, message, true);
+});
+
+bot.on('messageCreate', async (userId, conversation) => {
+	try {
+		const messages = await bot.inbox.messages.get(conversation.id);
+		if (messages && messages.length > 0) {
+			const latestMsg = messages[0];
+			if (latestMsg.category !== 'text') return; // We only care about text DMs now
+
+			// 1. Invites Handling Pipeline (Via Shared Room Link)
+			if (state.waitingForInviteUser === userId) {
+				// Improved regex to handle various Highrise room link formats and raw IDs
+				const roomLinkMatch = latestMsg.content.match(/\/room[s]?\/([a-fA-F0-9]{24})/i) || 
+									 latestMsg.content.match(/room_id=([a-fA-F0-9]{24})/i) ||
+									 latestMsg.content.match(/\b([a-fA-F0-9]{24})\b/);
+				
+				if (roomLinkMatch) {
+					const newRoomId = roomLinkMatch[1];
+					console.log(`[ROOM-TRANSFER] Acquired Target RoomID: ${newRoomId}`);
+					state.waitingForInviteUser = null; // Un-arm
+					await syncState();
+
+					const envPath = path.join(__dirname, '.env');
+					if (fs.existsSync(envPath)) {
+						// --- SAFETY BACKUP BEFORE PATCHING ---
+						state.lastGoodRoomId = bot.roomId || process.env.ROOM_ID;
+						state.lastSourceConversationId = conversation.id;
+						await syncState();
+
+						let envFile = fs.readFileSync(envPath, 'utf8');
+						envFile = envFile.replace(/ROOM_ID=[a-zA-Z0-9_\-]+/, `ROOM_ID=${newRoomId}`);
+						fs.writeFileSync(envPath, envFile, 'utf8');
+						console.log('[ROOM-TRANSFER] .env configuration successfully patched!');
+
+						try { bot.direct.send(conversation.id, "Link Processed! Transferring the bot to the new room now. Give me a few seconds to reconnect! 🚀 (If I fail, I will automatically return here.)"); } catch (e) { }
+
+						setTimeout(() => {
+							console.log(`[ROOM-TRANSFER] Hot-swapping to Room: ${newRoomId}`);
+							bot.roomId = newRoomId; // Update target
+							bot.connected = false;   // Reset internal connection state
+							if (bot.ws) bot.ws.close(); // Force the SDK to disconnect and trigger auto-reconnect logic
+						}, 2000);
+					}
+					return;
+				}
+			}
+
+			// 2. Command Dispatching over Inbox DMs
+			if (latestMsg.content.startsWith('!')) {
+				const parts = latestMsg.content.trim().split(/\s+/);
+				const cmdName = parts[0].toLowerCase();
+				
+				const handler = COMMAND_DISPATCHER[cmdName];
+				if (handler) {
+					// Use conversation.id as the 'id' for routing the reply back to Inbox
+					// But pass the raw 'userId' as 'actorId' for permission checks
+					const sender = { id: conversation.id, actorId: userId, username: userId };
+					try {
+						await handler(sender, parts, 'inbox');
+					} catch (e) {
+						console.error(`[INBOX CMD ERROR] ${e.message}`);
+					}
+					return;
+				}
+			}
+		}
+	} catch (error) {
+		console.error('[INBOX ERROR] payload parsing failed:', error);
+	}
+});
+
+bot.on('playerJoin', async (user) => {
+	const username = user?.username || user?.id || 'Guest';
+	console.log(`[JOIN] ${username} joined the room (ID: ${user?.id})`);
+	// console.log(`[DEBUG] User object:`, JSON.stringify(user));
+
+	// Try to send greeting with small delay
+	try {
+        // --- PRISON ENFORCEMENT ---
+        const prisonRecord = state.globalPrison?.[user.id];
+        if (prisonRecord && Date.now() < prisonRecord.until) {
+            const remainingMins = Math.ceil((prisonRecord.until - Date.now()) / 60000);
+            await send(null, `🛑 @${user.username} is still serving a prison sentence! Sending back to Prison...`);
+            await prisonUser(user.id, remainingMins);
+            return;
+        }
+
+		await new Promise(r => setTimeout(r, 800)); // Slight delay for better UX
+		
+		await bot.message.send(`Welcome to McDonalds! 🍔🍟✨ @${username}`);
+		console.log(`[GREETING SENT] to ${username}`);
+	} catch (err) {
+		console.error(`[GREETING ERROR] ${err?.message || String(err)}`);
+		console.error(`[GREETING DEBUG] Full error:`, err);
+	}
+});
+
+let followUserId = null;
+let lastRizzIdx = -1;
+let lastRoastIdx = -1;
+// Track last known positions for autotele distance calculation
+const playerLastPositions = new Map();
+
+bot.on('playerMove', async (user, position) => {
+	// 1. Follow logic
+	if (followUserId && user.id === followUserId && position.x !== undefined) {
+		bot.move.walk(position.x + 0.5, position.y, position.z + 0.5, position.facing);
+	}
+
+	// 2. Auto-Teleport logic (Available to EVERYONE, skip for bot itself)
+	if (state.autoTeleEnabled && user.id !== bot.userId) {
+		const prevPos = playerLastPositions.get(user.id);
+		
+		// If we have a previous position and we are not currently teleporting them
+		if (prevPos && position.x !== undefined) {
+			const dx = position.x - prevPos.x;
+			const dy = position.y - prevPos.y;
+			const dz = position.z - prevPos.z;
+			const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+			if (distance >= AUTOTELE_THRESHOLD) {
+				// Update position record BEFORE teleporting to prevent loop
+				playerLastPositions.set(user.id, { x: position.x, y: position.y, z: position.z });
+				
+				setTimeout(() => {
+					bot.player.teleport(user.id, position.x, position.y, position.z, position.facing);
+				}, 200);
+				return;
+			}
+		}
+	}
+
+	// Always update the last known position
+	playerLastPositions.set(user.id, { x: position.x, y: position.y, z: position.z });
+});
+
+bot.on('playerTip', async (sender, receiver, item) => {
+	// 1. Check if the tip was sent to the bot (using the correct global botUserId)
+	if (receiver.id !== botUserId) return;
+	
+	if (sender?.id) state.usernameCache[sender.id] = sender.username;
+
+	console.log(`[TIP] ${sender.username} sent ${item.amount} gold to bot.`);
+	
+	// 2. Track total gold in bot wallet
+	state.walletTotal = (state.walletTotal || 0) + item.amount;
+	await syncState();
+
+	// 3. Process VIP Subscription
+	if (item.amount >= state.vipPrice) {
+		const durationMs = state.vipDurationDays * 24 * 60 * 60 * 1000;
+		
+		// If they are already a sub, add time! If not, start from now.
+		const baseTime = (state.vipSubscriptions[sender.id] && state.vipSubscriptions[sender.id] > Date.now()) 
+			? state.vipSubscriptions[sender.id] 
+			: Date.now();
+			
+		state.vipSubscriptions[sender.id] = baseTime + durationMs;
+		
+		// Ensure they are also in the set list (for floor permissions)
+		if (!state.vipUserIds.includes(sender.id)) {
+			state.vipUserIds.push(sender.id);
+		}
+		
+		await syncState();
+
+		const expiryDate = new Date(state.vipSubscriptions[sender.id]).toLocaleString();
+		const msg = `💎 **VIP PURCHASE SUCCESS!** 💎\n\n` +
+					`🎉 Thank you for your support, @${sender.username}!\n` +
+					`✨ You have been granted VIP status for **${state.vipDurationDays} days**.\n` +
+					`📅 Your subscription expires on: **${expiryDate}**.\n\n` +
+					`🚀 Enjoy your exclusive floors and features!`;
+		
+		await send(sender.id, msg, true); // Send as DM
+	} else {
+		// Just a friendly receipt for small tips
+		const msg = `✨ **TIP RECEIVED!** ✨\n\n` +
+					`💰 Thank you for the ${item.amount} gold bars, @${sender.username}!\n` +
+					`📉 Note: VIP status requires a tip of **${state.vipPrice}g**. You are ${state.vipPrice - item.amount}g short for the upgrade!`;
+		await send(sender.id, msg, true);
+	}
+});
+
+bot.on('playerLeave', (user) => {
+	console.log(`[LEAVE] ${user?.username || user?.id}`);
+	if (user?.id === followUserId) followUserId = null;
+	if (user?.id) stopEmoteForUser(user.id);
+});
+
+bot.on('error', async (message) => {
+	const msg = String(message || '').toLowerCase();
+	
+	// --- FIX: Suppress "Target user not in room" logs ---
+	// This error is a common SDK race condition and isn't usually critical.
+	if (msg.includes('target user not in room')) return;
+
+	console.error(`[ERROR] ${message}`);
+	lastApiError = { message: msg, at: Date.now() };
+
+	// --- SAFETY REVERT TRIGGER ---
+	// If we hit "Room not found" or "Not authorized" and we have a backup room, jump back!
+	if (state.lastGoodRoomId && (msg.includes('room not found') || msg.includes('not authorized'))) {
+		console.warn(`[SAFETY] Move failed (${msg}). Reverting to: ${state.lastGoodRoomId}`);
+		
+		const failedTargetId = bot.roomId;
+		const backupId = state.lastGoodRoomId;
+		const convoId = state.lastSourceConversationId;
+
+		// 1. Wipe the trap
+		state.lastGoodRoomId = null; 
+		await syncState();
+
+		// 2. Alert the owner via the original Inbox thread
+		if (convoId) {
+			try { bot.direct.send(convoId, `⚠️ Move Failed: ${message}. I couldn't join room ${failedTargetId}. Returning to ${backupId} now!`); } catch(e){}
+		}
+
+		// 3. Patch .env back
+		const envPath = path.join(__dirname, '.env');
+		if (fs.existsSync(envPath)) {
+			let envFile = fs.readFileSync(envPath, 'utf8');
+			envFile = envFile.replace(/ROOM_ID=[a-zA-Z0-9_\-]+/, `ROOM_ID=${backupId}`);
+			fs.writeFileSync(envPath, envFile, 'utf8');
+		}
+
+		// 4. Hot-swap back
+		setTimeout(() => {
+			bot.roomId = backupId;
+			bot.connected = false;
+			if (bot.ws) bot.ws.close();
+		}, 1000);
+	}
+});
+
+// Capture last API error so command handlers can react to failures.
+let lastApiError = { message: '', at: 0 };
+let botUserId = null; // Cache the bot's user ID
+let roomOwnerId = null; // Cache the room owner's ID
+
+bot.on('roomModerate', (moderatorId, targetUserId, moderationType, duration) => {
+	const action = (moderationType || '').toLowerCase();
+	const common = {
+		actor: moderatorId || 'unknown',
+		target: targetUserId || 'unknown',
+		action,
+		duration: duration || 0,
+		at: Date.now()
+	};
+	if (action === 'ban') pushLog('bans', common);
+	if (action === 'unban') pushLog('unbans', common);
+	if (action === 'kick') pushLog('kicks', common);
+	if (action === 'mute') pushLog('mutes', common);
+	if (action === 'freeze' || action === 'unfreeze') pushLog('freezes', common);
+	if (action === 'void') pushLog('voids', common);
+	if (action === 'punch') pushLog('punches', common);
+	if (action === 'cut') pushLog('cuts', common);
+	if (action === 'slap') pushLog('slaps', common);
+});
+
+// STARTUP WRAPPER
+(async () => {
+	try {
+		// 1. Connect to Database
+		await connectDB();
+		
+		// 2. Fetch (and potentially migrate) state
+		await fetchState();
+
+		// 3. Login to Highrise
+		bot.login(settings.token, settings.room);
+
+		// 4. Re-arm Prison Timers (Global State)
+		if (state.globalPrison) {
+			for (const [uid, rec] of Object.entries(state.globalPrison)) {
+				const remaining = Math.max(0, rec.until - Date.now());
+				if (remaining > 0) {
+					const t = setTimeout(() => releaseUser(uid), remaining);
+					activePrisonTimers.set(uid, t);
+				} else {
+					delete state.globalPrison[uid];
+					await syncState();
+				}
+			}
+		}
+	} catch (err) {
+		console.error('[STARTUP FATAL] Failed to initialize bot:', err.message);
+		process.exit(1);
+	}
+})();
+
+// -----------------------
+// Command Router (minimal)
+// -----------------------
+function parseArgs(text) {
+	return text.trim().split(/\s+/g);
+}
+function parseTargetRoomId(input) {
+	if (!input || typeof input !== 'string') return null;
+	const raw = input.trim();
+	if (raw.startsWith('http://') || raw.startsWith('https://')) {
+		try {
+			const url = new URL(raw);
+			return url.searchParams.get('id') || null;
+		} catch {
+			// Some URLs might fail URL parsing; fall back to regex.
+		}
+	}
+	// Try common Highrise share formats.
+	const m = raw.match(/[?&]id=([a-fA-F0-9]{24})/);
+	if (m?.[1]) return m[1];
+	// If user pasted raw room id.
+	if (/^[a-fA-F0-9]{24}$/.test(raw)) return raw;
+	return null;
+}
+function normalizeUsername(u) {
+	if (!u) return '';
+	return u.replace(/^@/, '');
+}
+
+async function resolveUserIdByMention(mention) {
+	const username = normalizeUsername(mention);
+	try {
+		// 1. Prefer room cache with case-insensitive check
+		if (bot.room.players.userMap) {
+			const cachedUser = [...bot.room.players.userMap.values()]
+				.find(u => u.username.toLowerCase() === username.toLowerCase());
+			if (cachedUser) return cachedUser.id;
+		}
+
+		// 2. Check globalPrison list (Allows releasing users even if they are out of the room!)
+		if (state.globalPrison) {
+			const prisonerId = Object.keys(state.globalPrison).find(id => {
+				const rec = state.globalPrison[id];
+				return rec.username && rec.username.toLowerCase() === username.toLowerCase();
+			});
+			if (prisonerId) return prisonerId;
+		}
+
+		// 3. Fallback to fetch by username from SDK (May throw if not in room)
+		return await bot.room.players.getId(username);
+	} catch {
+		// 4. Final attempt: Global SDK lookup (if available in this version)
+		try {
+			if (bot.user?.id?.get) return await bot.user.id.get(username);
+		} catch (e) { }
+		return null;
+	}
+}
+
+function isProtected(userId) {
+	return state.protectedUserIds.includes(userId);
+}
+async function pushLog(key, entry) {
+	if (!state.logs) state.logs = {};
+	if (!Array.isArray(state.logs[key])) state.logs[key] = [];
+	state.logs[key].unshift(entry);
+	if (state.logs[key].length > 100) state.logs[key] = state.logs[key].slice(0, 100);
+	await syncState();
+}
+function formatLogItems(items) {
+	if (!items?.length) return 'No logs yet.';
+	return items
+		.slice(0, 10)
+		.map((x, i) => {
+			const at = new Date(x.at).toLocaleString();
+			return `${i + 1}. ${x.actor} -> ${x.target} (${x.action}) at ${at}`;
+		})
+		.join('\n');
+}
+const isVip = (userId) => {
+	const uid = userId?.actorId || userId?.id || userId; // Handle sender object or raw ID
+	// 1. Check manual VIP list
+	if (state.vipUserIds?.includes(uid)) return true;
+
+	// 2. Check active subscriptions in state.vipSubscriptions
+	const expiry = state.vipSubscriptions[uid];
+	if (expiry && Date.now() < expiry) return true;
+
+	// 3. Fallback to full controllers
+	return state.fullControllerUserIds?.includes(uid);
+};
+async function addProtection(userId) {
+	if (!state.protectedUserIds.includes(userId)) {
+		state.protectedUserIds.push(userId);
+		await syncState();
+	}
+}
+async function removeProtection(userId) {
+	const idx = state.protectedUserIds.indexOf(userId);
+	if (idx >= 0) {
+		state.protectedUserIds.splice(idx, 1);
+		await syncState();
+	}
+}
+
+function delay(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function getRoomPermissions(sender) {
+	const userId = (typeof sender === 'object') ? (sender.actorId || sender.id) : sender;
+	try {
+		if (!userId) return null;
+
+		// 1. Manually grant all permissions to the Room Owner
+		if (userId === roomOwnerId) {
+			return { moderator: true, designer: true, owner: true };
+		}
+		// 2. Fetch for others from SDK
+		const perms = await bot.player.permissions.get(userId);
+		// Room owners should have mod rights
+		if (perms && perms.owner) {
+			perms.moderator = true;
+		}
+		return perms;
+	} catch (e) {
+		console.warn(`Could not get permissions for ${userId}:`, e.message);
+		return null;
+	}
+}
+
+async function hasModeratorRights(sender) {
+	try {
+		const userId = (typeof sender === 'object') ? (sender.actorId || sender.id) : sender;
+		if (!userId) return false;
+
+		const perms = await getRoomPermissions(userId);
+		// Check for moderator, designer, or owner status
+		if (perms?.moderator || perms?.designer || perms?.owner) return true;
+		// Check if in full controller list
+		if ((state.fullControllerUserIds || []).includes(userId)) return true;
+		// Check if owner via env var
+		if (OWNER_USER_IDS.includes(userId)) return true;
+		return false;
+	} catch (e) {
+		console.warn(`Error checking moderator rights for ${userId}:`, e.message);
+		// Fallback to checking full controller or owner IDs
+		if ((state.fullControllerUserIds || []).includes(userId)) return true;
+		if (OWNER_USER_IDS.includes(userId)) return true;
+		return false;
+	}
+}
+
+async function isOwnerOnly(sender) {
+    // Handle both raw ID strings and sender objects
+    const userId = (typeof sender === 'object') ? (sender.actorId || sender.id) : sender;
+
+	// Dynamically trust the current room owner
+	if (roomOwnerId && userId === roomOwnerId) return true;
+	// Also trust IDs in the static owner list
+	if (OWNER_USER_IDS.length && OWNER_USER_IDS.includes(userId)) return true;
+	return false;
+}
+
+function getCachedUsername(userId) {
+	return state.usernameCache?.[userId] || userId;
+}
+
+async function getUserPosition(userId) {
+	try {
+		const players = await bot.room.players.fetch();
+		const p = players.find(([u]) => u.id === userId);
+		if (p?.[1]) return p[1];
+	} catch { }
+	// Fallback (fetches from API)
+	const pos = await bot.room.players.getPosition(userId);
+	return pos;
+}
+
+async function canUseTeleportPoint(actorId, point) {
+	const scope = point?.scope || ['e'];
+	const isV = isVip(actorId);
+	const isMod = await hasModeratorRights(actorId);
+	if (scope.includes('e')) return true;
+	if (scope.includes('m') && isMod) return true;
+	if (scope.includes('v') && (isMod || isV)) return true;
+	return false;
+}
+
+async function teleportToSavedPoint(actorId, pointName, isDm, replyToUserId) {
+    const roomState = await getRoomData(bot.roomId);
+	const key = (pointName || '').trim();
+	const point = roomState.teleportPoints?.[key];
+	if (!point) {
+		return send(replyToUserId, `Point not found: ${key}`, isDm);
+	}
+	const ok = await canUseTeleportPoint(actorId, point);
+	if (!ok) {
+		return send(replyToUserId, `No permission for point: ${key}`, isDm);
+	}
+	const pos = point.pos;
+	if (!pos) return send(replyToUserId, `Point has no position: ${key}`, isDm);
+
+	try {
+		// Verify user is in the room using their userId via a direct fetch check
+		const players = await bot.room.players.fetch();
+		const isInRoom = players.some(([u]) => u.id === actorId);
+
+		if (isInRoom) {
+			await bot.player.teleport(actorId, pos.x, pos.y, pos.z, pos.facing || 'FrontRight');
+			// In room chat, we don't always need a noisy reply, but let's keep it for confirmation for now
+			return send(replyToUserId, `Teleported to ${key}.`, isDm);
+		}
+	} catch (e) {
+		if (!e.message.includes('not in room')) console.error(`[TELEPORT ERROR] ${e.message}`);
+	}
+}
+
+function scopeToText(scope) {
+	if (!Array.isArray(scope) || scope.length === 0) return 'unknown';
+	if (scope.includes('e')) return 'e (everyone)';
+	if (scope.includes('m')) return 'm (mods)';
+	if (scope.includes('v')) return 'v (vip+mods)';
+	return scope.join(',');
+}
+
+async function formatTeleportPointsList() {
+	const roomState = await getRoomData(bot.roomId);
+	const points = roomState.teleportPoints || {};
+	const entries = Object.entries(points);
+	if (!entries.length) return 'No saved points.';
+	return entries
+		.slice(0, 50)
+		.map(([name, point]) => `${name}: ${scopeToText(point.scope)}`)
+		.join('\n');
+}
+
+async function send(target, text, type = false) {
+	try {
+        // Explicit check for Inbox DMs
+        const isPrivate = (type === 'inbox' || type === true);
+        const processedText = isPrivate ? `\n\n<color=#FFFF00>${text}</color>\n\n` : text;
+
+        if (type === 'inbox') {
+             bot.direct.send(target, processedText);
+             return;
+        }
+
+		if (type === true && target) {
+			bot.whisper.send(target, processedText);
+		} else {
+			bot.message.send(processedText);
+		}
+	} catch (e) {
+		console.error(`[SEND ERROR] ${e.message}`);
+	}
+}
+
+async function prisonUser(targetUserId, minutes = 10) {
+	if (!targetUserId) return;
+	if (isProtected(targetUserId)) return;
+	
+	// Transfer to the dedicated Prison Room
+	try {
+        bot.player.transport(targetUserId, PRISON_ROOMID);
+    } catch (e) {
+        console.error(`[PRISON JUMP FAILED] ${e.message}`);
+    }
+
+	const until = Date.now() + minutes * 60 * 1000;
+	if (!state.globalPrison) state.globalPrison = {};
+	
+	// Store username so we can resolve it even after the user leaves the room
+	const username = getCachedUsername(targetUserId) || 'Unknown User';
+    state.globalPrison[targetUserId] = { until, username };
+	await syncState();
+	
+    // Clear existing timer if any
+	if (activePrisonTimers.has(targetUserId)) {
+		clearTimeout(activePrisonTimers.get(targetUserId));
+	}
+	const timer = setTimeout(() => {
+		releaseUser(targetUserId);
+	}, minutes * 60 * 1000);
+	activePrisonTimers.set(targetUserId, timer);
+}
+
+async function releaseUser(targetUserId) {
+	if (!targetUserId) return;
+	if (state.globalPrison) {
+        delete state.globalPrison[targetUserId];
+    }
+	await syncState();
+	
+	// Since the user is in another room, we simply clear their local record.
+	// We don't attempt to teleport them back automatically.
+	try {
+        // --- FIX: Check if the user is actually in the room before teleporting ---
+        const players = await bot.room.players.fetch();
+        const player = players.find(([u]) => u.id === targetUserId);
+
+		if (player) {
+			const botPlayer = players.find(([u]) => u.id === botUserId);
+			const botPos = botPlayer?.[1];
+
+			if (botPos) {
+				await bot.player.teleport(targetUserId, botPos.x, botPos.y, botPos.z, botPos.facing || 'FrontRight');
+			}
+		}
+	} catch (e) {
+		// Suppress "Target user not in room" but log other errors
+        if (!e.message?.includes('Target user not in room')) {
+    		console.error(`[RELEASE ERROR] ${e.message}`);
+        }
+	}
+	if (activePrisonTimers.has(targetUserId)) {
+		clearTimeout(activePrisonTimers.get(targetUserId));
+		activePrisonTimers.delete(targetUserId);
+	}
+}
+
+async function releaseAll() {
+	if (!state.globalPrison) return;
+	const ids = Object.keys(state.globalPrison);
+	for (const uid of ids) {
+		await releaseUser(uid);
+	}
+}
+async function moveUserToRoom(targetUserId, roomInput) {
+	const targetRoomId = parseTargetRoomId(roomInput);
+	if (!targetRoomId) return { ok: false, error: 'Invalid room link/id.' };
+	if (isProtected(targetUserId)) return { ok: false, error: 'That user is protected.' };
+	try {
+		const before = lastApiError.at;
+		bot.player.transport(targetUserId, targetRoomId);
+		await new Promise((r) => setTimeout(r, 1200));
+		if (lastApiError.at > before && lastApiError.message.toLowerCase().includes('not authorized')) {
+			return { ok: false, error: lastApiError.message };
+		}
+		return { ok: true, roomId: targetRoomId };
+	} catch {
+		return { ok: false, error: 'Move failed.' };
+	}
+}
+async function moveAllToRoom(roomInput) {
+	const targetRoomId = parseTargetRoomId(roomInput);
+	if (!targetRoomId) return { moved: 0, skipped: 0, error: 'Invalid room link/id.' };
+	let moved = 0;
+	let skipped = 0;
+	try {
+		const users = await bot.room.players.fetch();
+		const botId = bot.client.id.get();
+		for (const row of users) {
+			const uid = row?.[0]?.id;
+			if (!uid || uid === botId || isProtected(uid)) {
+				skipped += 1;
+				continue;
+			}
+			const before = lastApiError.at;
+			bot.player.transport(uid, targetRoomId);
+			await new Promise((r) => setTimeout(r, 600));
+			if (lastApiError.at > before && lastApiError.message.toLowerCase().includes('not authorized')) {
+				// Bot has no permissions in the destination room; stop early.
+				return { moved, skipped, error: lastApiError.message, roomId: targetRoomId };
+			}
+			moved += 1;
+		}
+		return { moved, skipped, roomId: targetRoomId };
+	} catch {
+		return { moved, skipped, error: 'Moveall failed.' };
+	}
+}
+
+// Sentences are now re-armed within the Startup Wrapper below.
+
+// -----------------------
+// Emote System
+// -----------------------
+const EMOTE_MAP = {
+	"rest": "sit-idle-cute",
+	"zombie": "idle_zombie",
+	"relaxed": "idle_layingdown2",
+	"attentive": "idle_layingdown",
+	"sleepy": "idle-sleep",
+	"sleepyloop": "idle-loop-tired",
+	"poutyface": "idle-sad",
+	"posh": "idle-posh",
+	"taploop": "idle-loop-tapdance",
+	"sit": "idle-loop-sitfloor",
+	"shy": "emote-shy",
+	"bummed": "idle-loop-sad",
+	"chillin": "idle-loop-happy",
+	"annoyed": "idle-loop-annoyed",
+	"aerobics": "idle-loop-aerobics",
+	"ponder": "idle-lookup",
+	"heropose": "idle-hero",
+	"relaxing": "idle-floorsleeping2",
+	"cozynap": "idle-floorsleeping",
+	"enthused": "idle-enthusiastic",
+	"boogieswing": "idle-dance-swinging",
+	"feelthebeat": "idle-dance-headbobbing",
+	"irritated": "idle-angry",
+
+	"yes": "emote-yes",
+	"wave": "emote-wave",
+	"tired": "emote-tired",
+	"think": "emote-think",
+	"theatrical": "emote-theatrical",
+	"tapdance": "emote-tapdance",
+	"superrun": "emote-superrun",
+	"superpunch": "emote-superpunch",
+	"sumofight": "emote-sumo",
+	"thumbsuck": "emote-suckthumb",
+	"splitsdrop": "emote-splitsdrop",
+	"snowball": "emote-snowball",
+	"snowangel": "emote-snowangel",
+	"secrethandshake": "emote-secrethandshake",
+	"sad": "emote-sad",
+	"ropepull": "emote-ropepull",
+	"roll": "emote-roll",
+	"rofl": "emote-rofl",
+	"robot": "emote-robot",
+	"rainbow": "emote-rainbow",
+	"proposing": "emote-proposing",
+	"peekaboo": "emote-peekaboo",
+	"peace": "emote-peace",
+	"panic": "emote-panic",
+	"no": "emote-no",
+	"ninjarun": "emote-ninjarun",
+	"nightfever": "emote-nightfever",
+	"monsterfail": "emote-monster_fail",
+	"model": "emote-model",
+	"flirtywave": "emote-lust",
+	"levelup": "emote-levelup",
+	"amused": "emote-laughing2",
+	"laugh": "emote-laughing",
+	"kiss": "emote-kiss",
+	"superkick": "emote-kicking",
+	"jump": "emote-jumpb",
+	"judochop": "emote-judochop",
+	"jetpack": "emote-jetpack",
+	"hugyourself": "emote-hugyourself",
+	"hot": "emote-hot",
+	"heroentrance": "emote-hero",
+	"hello": "emote-hello",
+	"headball": "emote-headball",
+	"harlemshake": "emote-harlemshake",
+	"happy": "emote-happy",
+	"handstand": "emote-handstand",
+	"greedy": "emote-greedy",
+	"graceful": "emote-graceful",
+	"moonwalk": "emote-gordonshuffle",
+	"ghostfloat": "emote-ghost-idle",
+	"gangnamstyle": "emote-gangnam",
+	"frolic": "emote-frollicking",
+	"faint": "emote-fainting",
+	"clumsy": "emote-fail2",
+	"fall": "emote-fail1",
+	"facepalm": "emote-exasperatedb",
+	"exasperated": "emote-exasperated",
+	"elbowbump": "emote-elbowbump",
+	"disco": "emote-disco",
+	"blastoff": "emote-disappear",
+	"faintdrop": "emote-deathdrop",
+	"collapse": "emote-death2",
+	"revival": "emote-death",
+	"dab": "emote-dab",
+	"curtsy": "emote-curtsy",
+	"confusion": "emote-confused",
+	"cold": "emote-cold",
+	"charging": "emote-charging",
+	"bunnyhop": "emote-bunnyhop",
+	"bow": "emote-bow",
+	"boo": "emote-boo",
+	"homerun": "emote-baseball",
+	"fallingapart": "emote-apart",
+
+	"thumbsup": "emoji-thumbsup",
+	"point": "emoji-there",
+	"sneeze": "emoji-sneeze",
+	"smirk": "emoji-smirking",
+	"sick": "emoji-sick",
+	"gasp": "emoji-scared",
+	"punch": "emoji-punch",
+	"pray": "emoji-pray",
+	"stinky": "emoji-poop",
+	"naughty": "emoji-naughty",
+	"mindblown": "emoji-mind-blown",
+	"lying": "emoji-lying",
+	"levitate": "emoji-halo",
+	"fireball": "emoji-hadoken",
+	"giveup": "emoji-give-up",
+	"tummyache": "emoji-gagging",
+	"flex": "emoji-flex",
+	"stunned": "emoji-dizzy",
+	"cursing": "emoji-cursing",
+	"sob": "emoji-crying",
+	"clap": "emoji-clapping",
+	"celebrate": "emoji-celebrate",
+	"arrogance": "emoji-arrogance",
+	"angry": "emoji-angry",
+
+	"voguehands": "dance-voguehands",
+	"savage": "dance-tiktok8",
+	"dontstartnow": "dance-tiktok2",
+	"yogaflow": "dance-spiritual",
+	"smoothwalk": "dance-smoothwalk",
+	"singleladies": "dance-singleladies",
+	"shoppingcart": "dance-shoppingcart",
+	"russian": "dance-russian",
+	"robotic": "dance-robotic",
+	"pennywise": "dance-pennywise",
+	"orangejustice": "dance-orangejustice",
+	"rockout": "dance-metal",
+	"karate": "dance-martial-artist",
+	"macarena": "dance-macarena",
+	"handsup": "dance-handsup",
+	"floss": "dance-floss",
+	"duckwalk": "dance-duckwalk",
+	"breakdance": "dance-breakdance",
+	"kpop": "dance-blackpink",
+	"pushups": "dance-aerobics",
+
+	"hyped": "emote-hyped",
+	"jinglebell": "dance-jinglebell",
+	"nervous": "idle-nervous",
+	"toilet": "idle-toilet",
+	"attention": "emote-attention",
+	"astronaut": "emote-astronaut",
+	"dancezombie": "dance-zombie",
+	"ghost": "emoji-ghost",
+	"hearteyes": "emote-hearteyes",
+	"swordfight": "emote-swordfight",
+	"timejump": "emote-timejump",
+	"worm": "emote-snake",
+	"snake": "emote-snake",
+	"heartfingers": "emote-heartfingers",
+	"heartshape": "emote-heartshape",
+	"hug": "emote-hug",
+	"eyeroll": "emoji-eyeroll",
+	"embarrassed": "emote-embarrassed",
+	"float": "emote-float",
+	"telekinesis": "emote-telekinesis",
+	"sexydance": "dance-sexy",
+	"puppet": "emote-puppet",
+	"fighteridle": "idle-fighter",
+	"penguindance": "dance-pinguin",
+	"creepypuppet": "dance-creepypuppet",
+	"sleigh": "emote-sleigh",
+	"maniac": "emote-maniac",
+	"energyball": "emote-energyball",
+	"singing": "idle_singing",
+	"frog": "emote-frog",
+	"superpose": "emote-superpose",
+	"cute": "emote-cute",
+	"tiktok9": "dance-tiktok9",
+	"weird": "dance-weird",
+	"tiktok10": "dance-tiktok10",
+	"pose7": "emote-pose7",
+	"pose8": "emote-pose8",
+	"casualdance": "idle-dance-casual",
+	"pose1": "emote-pose1",
+	"pose3": "emote-pose3",
+	"pose5": "emote-pose5",
+	"cutey": "emote-cutey",
+	"punkguitar": "emote-punkguitar",
+	"zombierun": "emote-zombierun",
+	"fashionista": "emote-fashionista",
+	"gravity": "emote-gravity",
+	"icecream": "dance-icecream",
+	"wrong": "dance-wrong",
+	"uwu": "idle-uwu",
+	"tiktok4": "idle-dance-tiktok4",
+	"advancedshy": "emote-shy2",
+	"anime": "dance-anime",
+	"kawaii": "dance-kawai",
+	"scritchy": "idle-wild",
+	"iceskating": "emote-iceskating",
+	"surprisebig": "emote-pose6",
+	"celebrationstep": "emote-celebrationstep",
+	"creepycute": "emote-creepycute",
+	"frustrated": "emote-frustrated",
+	"pose10": "emote-pose10",
+	"sitrelaxed": "sit-relaxed",
+	"laidback": "sit-open",
+	"stargazing": "emote-stargaze",
+	"slap": "emote-slap",
+	"boxer": "emote-boxer",
+	"headblowup": "emote-headblowup",
+	"kawaiigogo": "emote-kawaiigogo",
+	"repose": "emote-repose",
+	"tiktok7": "idle-dance-tiktok7",
+	"shrink": "emote-shrink",
+	"ditzypose": "emote-pose9",
+	"teleporting": "emote-teleporting",
+	"touch": "dance-touch",
+	"airguitar": "idle-guitar",
+	"gift": "emote-gift",
+	"pushit": "dance-employee"
+};
+const EMOTE_KEYS = Object.keys(EMOTE_MAP);
+const EMOTE_LIST = Object.values(EMOTE_MAP);
+
+const EMOTE_DURATIONS = {
+	'emote-hello': 2000,
+	'emote-shy': 2000,
+	'emote-sad': 2000,
+	'emote-kiss': 2000,
+	'emote-laughing': 2500,
+	'emote-thoughtful': 3000,
+	'emote-lust': 2500,
+	'emote-curtsy': 2500,
+	'emote-greedy': 2500,
+	'emote-flex': 3000,
+	'emote-tired': 3000,
+	'emote-gag': 3000,
+	'emote-thumbsup': 2000,
+	'emote-no': 2000,
+	'emote-yes': 2000,
+	'emote-faint': 3500,
+	'emote-sleepy': 3500,
+	'emote-hot': 2500,
+	'emote-snowangel': 4500,
+	'emote-snowball': 2500,
+	'emote-confused': 3000,
+	'emote-celebrate': 3500,
+	'emote-peace': 2500,
+	'emote-zombie': 4000,
+	'emote-monster': 4000,
+	'dance-macarena': 10000,
+	'emote-ghost-float': 10000,
+	'emote-laidback': 15000,
+	'emote-gravity': 9000,
+	'emote-teleporting': 3000,
+	'dance-handsup': 4500,
+	'dance-shoppingcart': 5000,
+	'dance-paparazzi': 5000,
+	'dance-russian': 5000,
+	'dance-voguehands': 4500,
+	'dance-weird': 5000
+};
+
+const cooldowns = new Map();
+
+/**
+ * Checks if a user is on cooldown for a specific command.
+ * @param {string} userId - The ID of the user.
+ * @param {string} cmd - The command name.
+ * @returns {boolean} - True if on cooldown, false otherwise.
+ */
+function isOnCooldown(userId, cmd) {
+	const key = `${userId}-${cmd}`;
+	const now = Date.now();
+	if (cooldowns.has(key) && now - cooldowns.get(key) < 2000) {
+		return true;
+	}
+	cooldowns.set(key, now);
+	return false;
+}
+
+const activeUserEmotes = new Map(); // userId -> { timer, emoteId, ms }
+
+function loopEmoteForUser(userId, emoteId, customMs = null) {
+	// Clear existing loop if any
+	stopEmoteForUser(userId);
+
+	// Determine duration
+	const ms = customMs || EMOTE_DURATIONS[emoteId] || 3500;
+
+	// Recursive trigger function
+	const run = () => {
+		bot.player.emote(userId, emoteId);
+		const timer = setTimeout(run, ms);
+		activeUserEmotes.set(userId, { timer, emoteId, ms });
+	};
+
+	run();
+}
+
+function stopEmoteForUser(userId) {
+	if (activeUserEmotes.has(userId)) {
+		const rec = activeUserEmotes.get(userId);
+		clearTimeout(rec.timer);
+		activeUserEmotes.delete(userId);
+		// Optionally send "0" to stop the animation immediately (best-effort)
+		bot.player.emote(userId, '0');
+	}
+}
+
+let activeBotDanceTimer = null;
+
+async function performBotEmote(emoteId) {
+	try {
+		if (!botUserId) {
+			botUserId = bot.client.id.get();
+		}
+		if (botUserId) {
+			bot.player.emote(botUserId, emoteId);
+		}
+	} catch (e) {
+		console.error('Error performing bot emote:', e);
+	}
+}
+
+function startBotDance() {
+	if (activeBotDanceTimer) stopBotDance();
+	const emotes = Object.values(EMOTE_MAP);
+	let index = 0;
+	activeBotDanceTimer = setInterval(() => {
+		performBotEmote(emotes[index]);
+		index = (index + 1) % emotes.length;
+	}, 4000);
+}
+
+function stopBotDance() {
+	if (activeBotDanceTimer) {
+		clearInterval(activeBotDanceTimer);
+		activeBotDanceTimer = null;
+	}
+}
+
+async function handleChatCommand(sender, text, isDm) {
+	if (typeof text !== 'string') return;
+	// Skip processing the bot's own messages
+	if (sender.username === 'ZillaBOT' || (botUserId && sender.id === botUserId)) return;
+
+	const message = text.trim();
+	if (!message.startsWith('!')) {
+		// Handle numeric triggers and points (only in room chat)
+		if (!isDm) {
+			const parts = parseArgs(message);
+			const token = (parts[0] || '').toLowerCase();
+
+			if (token === 'points' || token === 'floors') {
+				if (await hasModeratorRights(sender.id)) return send(null, await formatTeleportPointsList(), false);
+			}
+
+			const roomState = await getRoomData(bot.roomId);
+
+			if (token === 'vip') {
+				const isMod = await hasModeratorRights(sender.id);
+				const isV = isVip(sender.id);
+				if (isMod || isV) {
+					if (!roomState.vipSpawnPos) return send(null, 'VIP spawn not set.', false);
+					
+					// SUPPORT TARGETING: check for @mention as second part
+					const targetMention = parts[1];
+					let targetId = sender.id;
+					if (targetMention && isMod) {
+						targetId = await resolveUserIdByMention(targetMention);
+						if (!targetId) return send(null, `User not found: ${targetMention}`, false);
+					}
+
+					await bot.player.teleport(targetId, roomState.vipSpawnPos.x, roomState.vipSpawnPos.y, roomState.vipSpawnPos.z, roomState.vipSpawnPos.facing || 'FrontRight');
+					return;
+				}
+			}
+
+			// Match teleport points (f1, f2, etc)
+			// Strip trailing punctuation (., !, ?) and leading ! if present
+			const cleanToken = token.replace(/[.!?;:,]$/, "").replace(/^!/, "");
+			const points = roomState.teleportPoints || {};
+			
+			if (points[cleanToken]) {
+				// SUPPORT TARGETING: check for @mention as second part
+				const targetMention = parts[1];
+				let targetId = sender.id;
+				if (targetMention && (await hasModeratorRights(sender.id))) {
+					targetId = await resolveUserIdByMention(targetMention);
+					if (!targetId) return send(null, `User not found: ${targetMention}`, false);
+				}
+
+				return await teleportToSavedPoint(targetId, cleanToken, false, null);
+			}
+		}
+
+		// --- Emote Triggers (No Prefix) ---
+		const lowerMsg = message.toLowerCase();
+		if (lowerMsg === 'stop' || lowerMsg === '0') {
+			stopEmoteForUser(sender.id);
+			return send(isDm ? sender.id : null, 'Emote loop stopped.', isDm);
+		}
+
+		// Smart matching: try exact match, spaceless match, or numeric index
+		const spacelessMsg = lowerMsg.replace(/\s+/g, '');
+		let emoteId = EMOTE_MAP[lowerMsg] || EMOTE_MAP[spacelessMsg];
+
+		if (!emoteId && /^\d+$/.test(lowerMsg)) {
+			const idx = parseInt(lowerMsg);
+			if (idx >= 1 && idx <= EMOTE_LIST.length) emoteId = EMOTE_LIST[idx - 1];
+			// Removed literal ID fallback to prevent accidental triggers (e.g. typing numbers in chat)
+		}
+
+		if (emoteId) {
+			loopEmoteForUser(sender.id, emoteId);
+			return;
+		}
+
+		if (!isDm) {
+			const parts = parseArgs(message);
+
+			if (parts.length >= 2) {
+				const lastArgOriginal = parts[parts.length - 1];
+				const lastArgLower = lastArgOriginal.toLowerCase();
+
+				if (lastArgLower === 'all' || lastArgLower.startsWith('@')) {
+					const emoteNameRaw = parts.slice(0, -1).join(' ').toLowerCase();
+					const spacelessName = emoteNameRaw.replace(/\s+/g, '');
+					let emoteId = EMOTE_MAP[emoteNameRaw] || EMOTE_MAP[spacelessName];
+
+					// Check numeric index for broad triggers
+					if (!emoteId && /^\d+$/.test(emoteNameRaw)) {
+						const idx = parseInt(emoteNameRaw);
+						if (idx >= 1 && idx <= EMOTE_LIST.length) emoteId = EMOTE_LIST[idx - 1];
+						else emoteId = emoteNameRaw;
+					}
+
+					if (emoteId) {
+						if (lastArgLower === 'all') {
+							const allowed = (await hasModeratorRights(sender.id)) || isVip(sender.id);
+							if (!allowed) return;
+
+							const entries = await bot.room.players.fetch();
+							const ids = entries.map(([u]) => u.id).filter(id => id && id !== botUserId);
+							for (const uid of ids) bot.player.emote(uid, emoteId);
+
+							// Bot also joins the fun
+							await performBotEmote(emoteId);
+
+							return send(null, `Emote "${emoteNameRaw}" performed by everyone.`, false);
+						}
+						// Targeting a specific user performs it once
+						// Use original casing for mentions to help the SDK/lookup
+						const targetId = await resolveUserIdByMention(lastArgOriginal);
+						if (targetId) bot.player.emote(targetId, emoteId);
+						return;
+					}
+				}
+			}
+		}
+		return;
+	}
+
+	// --- Command Dispatcher ---
+	const args = parseArgs(message);
+	const cmdName = args[0].toLowerCase();
+
+	if (isOnCooldown(sender.id, cmdName)) {
+		return send(isDm ? sender.id : null, `Slow down! This command is on cooldown.`, isDm);
+	}
+
+	// Dynamic floor parsing (e.g., !setf1, !setf2vip, !setmodf3)
+	const floorMatch = cmdName.match(/^!set(vip|mod)?f(\d+)(vip|mod)?$/);
+	if (floorMatch) {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+
+		const tag = (floorMatch[1] || floorMatch[3] || '').toLowerCase();
+		const isVip = tag === 'vip';
+		const isModOnly = tag === 'mod';
+		const floorNum = floorMatch[2];
+		const floorName = `f${floorNum}`;
+
+		const pos = await getUserPosition(sender.id);
+		const roomState = await getRoomData(bot.roomId);
+		roomState.teleportPoints[floorName] = {
+			pos: { x: pos.x, y: pos.y, z: pos.z, facing: pos.facing || 'FrontRight' },
+			scope: isModOnly ? ['m'] : (isVip ? ['v'] : ['e'])
+		};
+		await syncRoomData(bot.roomId, roomState);
+
+		let scopeLabel = 'Everyone';
+		if (isVip) scopeLabel = 'VIP & Mods';
+		if (isModOnly) scopeLabel = 'MODS & Owner ONLY';
+
+		send(isDm ? sender.id : null, `Saved ${scopeLabel} floor: ${floorName}. (Type "${floorName}" to go here!)`, isDm);
+		return;
+	}
+
+	const handler = COMMAND_DISPATCHER[cmdName];
+	if (handler) {
+		try {
+			await handler(sender, args, isDm);
+		} catch (error) {
+			console.error(`[ERROR] Command ${cmdName} failed:`, error);
+			send(isDm ? sender.id : null, `An error occurred while executing ${cmdName}.`, isDm);
+		}
+	}
+}
+
+// Targeted help function for moderation commands
+async function withTarget(sender, args, actionCmd, actionType, isDm, userMentionIndex = 1, durationSeconds = null) {
+	const mention = args[userMentionIndex];
+	const targetId = mention ? await resolveUserIdByMention(mention) : null;
+	if (!targetId) {
+		send(isDm ? sender.id : null, 'User not found.', isDm);
+		return null;
+	}
+	if (isProtected(targetId)) {
+		send(isDm ? sender.id : null, 'That user is protected.', isDm);
+		return null;
+	}
+	const before = lastApiError.at;
+	try {
+		if (actionCmd === '!kick') await bot.player.kick(targetId);
+		else if (actionCmd === '!mute') await bot.player.mute(targetId, durationSeconds);
+		else if (actionCmd === '!unmute') await bot.player.unmute(targetId);
+		else if (actionCmd === '!ban') await bot.player.ban(targetId, durationSeconds);
+		else if (actionCmd === '!unban') await bot.player.unban(targetId);
+		else await bot.player.moderateRoom({ user_id: targetId, moderation_action: actionType, action_length: durationSeconds });
+
+		await delay(800);
+		if (lastApiError.at > before && lastApiError.message.toLowerCase().includes('not authorized')) {
+			send(isDm ? sender.id : null, lastApiError.message, isDm);
+			return null;
+		}
+		return targetId;
+	} catch (e) {
+		console.error(`[MOD] Action ${actionCmd} failed:`, e);
+		return null;
+	}
+}
+
+const COMMAND_DISPATCHER = {
+	'!help': async (sender, args, isDm) => {
+		const role = (args[1] || '').toLowerCase();
+
+		if (role === 'owner') {
+			if (!(await isOwnerOnly(sender))) return send(sender.id, '❌ This menu is for the **Owner** only.', isDm || true);
+			const msgs = [
+				"<color=#FFFF00>👑 **OWNER CONTROL CENTER**</color>\n\n" +
+				"--- **BOT CONTROL** ---\n" +
+				"• !come / !here - Bot walks to you\n" +
+				"• !walk x y z - Bot walks to coords\n" +
+				"• !follow @user - Bot follows user\n" +
+				"• !stay / !stopfollow - Stop following\n" +
+				"• !botdance - Bot cycles all emotes\n" +
+				"• !stopbot - Stop bot dancing\n" +
+				"• !copy @user - Bot copies user's outfit\n" +
+				"• !changeroom - Transfer bot to new room\n" +
+				"• !autotele on/off - Toggle auto-teleport\n\n" +
+				"--- **FLOOR MANAGEMENT** ---\n" +
+				"• !setf[num] - Set a public floor\n" +
+				"• !setf[num]vip - Set a VIP-only floor\n" +
+				"• !setf[num]mod - Set a mod-only floor\n" +
+				"• !delfloor [name] - Delete a floor\n" +
+				"• !wipefloors - Clear all floors\n" +
+				"• !setspawn - Set bot's spawn point\n" +
+				"• !setvipspawn - Set VIP spawn point",
+
+				"--- **VIP MANAGEMENT** ---\n" +
+				"• !vipadd @user [days] - Grant VIP\n" +
+				"• !vipdel @user - Revoke VIP\n" +
+				"• !viplist - List all VIPs\n" +
+				"• !setvipprice [amount] - VIP cost\n" +
+				"• !setvipduration [days] - VIP length\n\n" +
+				"--- **WALLET & FINANCE** ---\n" +
+				"• !wallet - Check bot's gold balance\n" +
+				"• !withdraw [amount] - Bot tips gold to you\n\n" +
+				"--- **BROADCASTING** ---\n" +
+				"• !broadcast [message] - DM all subs\n" +
+				"• !inviteall - Invite all subs to room\n\n" +
+				"--- **ROLES** ---\n" +
+				"• !fullc @user - Grant full controller"
+			];
+			for (const msg of msgs) { await send(sender.id, msg, isDm || true); await delay(400); }
+
+		} else if (role === 'mod') {
+			if (!(await hasModeratorRights(sender))) return send(sender.id, '❌ This menu is for **Staff** only.', isDm || true);
+			const msgs = [
+				"<color=#FFFF00>🛡️ **MODERATOR SUITE**</color>\n\n" +
+				"--- **MODERATION** ---\n" +
+				"• !kick @user - Kick a user\n" +
+				"• !ban @user [mins] - Ban a user\n" +
+				"• !unban @user - Unban a user\n" +
+				"• !mute @user [mins] - Mute a user\n" +
+				"• !unmute @user - Unmute a user\n" +
+				"• !freeze @user - Freeze a user\n" +
+				"• !unfreeze @user - Unfreeze a user\n" +
+				"• !unfreezeall - Unfreeze everyone\n" +
+				"• !void @user - Void a user\n" +
+				"• !protect @user - Protect a user\n" +
+				"• !unprotect @user - Remove protection\n" +
+				"• !protected - List protected users\n\n" +
+				"--- **PRISON** ---\n" +
+				"• !prison @user [mins] - Send to prison\n" +
+				"• !release @user - Release early\n" +
+				"• !releaseall - Release all prisoners",
+
+				"--- **TELEPORTATION** ---\n" +
+				"• !send @user [floor] - Send to floor\n" +
+				"• !sendall [floor] - Send everyone to floor\n" +
+				"• !move @user [link] - Move to room\n" +
+				"• !moveall [link] - Move everyone to room\n\n" +
+				"--- **EMOTES** ---\n" +
+				"• [emote_name] all - Play on everyone\n" +
+				"• !party @u1 @u2 [emote] - Start party\n" +
+				"• !partys - Stop emote party\n\n" +
+				"--- **LOGS & INFO** ---\n" +
+				"• !bans / !kicks / !mutes / !voids\n" +
+				"• !slaps / !punches / !freezes\n" +
+				"• !subcounts - Subscriber count\n" +
+				"• !floors / points - List all floors"
+			];
+			for (const msg of msgs) { await send(sender.id, msg, isDm || true); await delay(400); }
+
+		} else if (role === 'vip') {
+			const msgs = [
+				"<color=#FFFF00>💎 **VIP EXCLUSIVE PERKS**</color>\n\n" +
+				"--- **TELEPORTATION** ---\n" +
+				"• !tp @user - Teleport to a user\n" +
+				"• !summon @user - Pull user to you\n" +
+				"• vip - Go to VIP spawn point\n" +
+				"• f3, etc. - Access VIP-only floors\n\n" +
+				"--- **EMOTES** ---\n" +
+				"• [emote_name] all - Play on everyone"
+			];
+			for (const msg of msgs) { await send(sender.id, msg, isDm || true); await delay(400); }
+
+		} else if (role === 'user') {
+			const msgs = [
+				"🎮 **USER COMMANDS** (Interaction):\n\n" +
+				"--- **INTERACTION** ---\n" +
+				"• !punch/!slap/!cut @user : Trigger an action against someone.\n" +
+				"• !rizz @user : Send a random pick-up line.\n" +
+				"• !roast @user : Burn someone with a random roast.\n" +
+				"• !tp @user : Instantly teleport yourself to another player.",
+
+				"--- **SELF EXPRESSION** ---\n" +
+				"• !emotes : View the list of all emotes by ID.\n" +
+				"• [emote_id] : Type an emote ID to loop that emote.",
+
+				"--- **SUBSCRIPTIONS** (DM ONLY) ---\n" +
+				"• !sub : Subscribe to bot announcements and news.\n" +
+				"• !unsub : Opt-out of bot messaging anytime."
+			];
+			for (const msg of msgs) { await send(sender.id, msg, isDm); await delay(400); }
+
+		} else {
+			await send(sender.id, "📚 **ZillaBot Comprehensive Help System**\n\nPlease select your command category for more details:\n\n• !help owner\n• !help mod\n• !help vip\n• !help user\n\n*(Reminder: Help is only shown here in Private DMs!)*", isDm);
+		}
+	},
+	'!walk': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		if (args.length < 4) return send(isDm ? sender.id : null, 'Usage: !walk <x> <y> <z> [facing]', isDm);
+		const x = parseFloat(args[1]), y = parseFloat(args[2]), z = parseFloat(args[3]);
+		if (isNaN(x) || isNaN(y) || isNaN(z)) return send(isDm ? sender.id : null, 'Invalid coords.', isDm);
+		bot.move.walk(x, y, z, args[4] || 'FrontLeft');
+	},
+	'!come': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const players = await bot.room.players.fetch();
+		const player = players.find(([u]) => u.id === sender.id);
+		if (player?.[1]) {
+			followUserId = null;
+			bot.move.walk(player[1].x, player[1].y, player[1].z, player[1].facing);
+		} else send(isDm ? sender.id : null, 'Move once first!', isDm);
+	},
+	'!here': (s, a, d) => COMMAND_DISPATCHER['!come'](s, a, d),
+	'!follow': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const target = args[1] || 'me';
+		const targetId = (target.toLowerCase() === 'me') ? sender.id : await resolveUserIdByMention(target);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		followUserId = targetId;
+		send(isDm ? sender.id : null, `Following ${target}.`, isDm);
+	},
+	'!stay': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		followUserId = null;
+		send(isDm ? sender.id : null, 'Stopped following.', isDm);
+	},
+	'!stopfollow': (s, a, d) => COMMAND_DISPATCHER['!stay'](s, a, d),
+	'!emote': async (sender, args, isDm) => {
+		if (!args[1]) return;
+		const name = args[1].toLowerCase();
+		await performBotEmote(EMOTE_MAP[name] || name);
+	},
+	'!emotes': async (sender, args, isDm) => {
+		for (let i = 0; i < EMOTE_KEYS.length; i += 15) {
+			const chunk = EMOTE_KEYS.slice(i, i + 15).map((name, idx) => `${i + idx + 1}. ${name}`);
+			// Force type to true (whisper) if it's not already in an inbox DM
+			await send(sender.id, `Emotes: ${chunk.join(', ')}`, isDm || true);
+			await delay(500);
+		}
+	},
+	'!autotele': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const arg = (args[1] || '').toLowerCase();
+		if (arg === 'on') {
+			state.autoTeleEnabled = true;
+			await syncState();
+			send(isDm ? sender.id : null, 'Auto-Teleport: ENABLED (Long walks will be skipped).', isDm);
+		} else if (arg === 'off') {
+			state.autoTeleEnabled = false;
+			await syncState();
+			send(isDm ? sender.id : null, 'Auto-Teleport: DISABLED.', isDm);
+		} else {
+			send(isDm ? sender.id : null, 'Usage: !autotele on / off', isDm);
+		}
+	},
+	'!wallet': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		
+		// Force raw fetch to bypass SDK's internal caching
+		const walletData = await bot.wallet.fetch();
+		const gold = (walletData || []).find(item => item.type === 'gold')?.amount || 0;
+		
+		send(sender.id, `📈 **REAL BOT WALLET**: ${gold} Gold Bars.`, true);
+	},
+	'!withdraw': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		
+		const amount = parseInt(args[1]);
+		const validBars = [1, 5, 10, 50, 100, 500, 1000, 5000, 10000];
+		
+		if (!validBars.includes(amount)) {
+			return send(isDm ? sender.id : null, `❌ Invalid bar size! Supported bars: ${validBars.join(', ')}g.`, isDm);
+		}
+
+		const currentBalance = await bot.wallet.get.gold.amount();
+		if (currentBalance < amount) {
+			return send(isDm ? sender.id : null, `❌ Insufficient funds! Bot only has ${currentBalance} gold.`, isDm);
+		}
+
+		try {
+			await bot.player.tip(sender.id, amount);
+			send(isDm ? sender.id : null, `💸 **WITHDRAWAL SUCCESS!** Bot tipped you **${amount}g**.`, isDm);
+		} catch (e) {
+			send(isDm ? sender.id : null, `⚠️ Withdrawal failed: ${e.message}`, isDm);
+		}
+	},
+	'!setvipprice': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const amount = parseInt(args[1]);
+		if (isNaN(amount)) return send(sender.id, 'Usage: !setvipprice <gold_amount>', true);
+		state.vipPrice = amount;
+		await syncState();
+		send(sender.id, `🏷️ VIP Price set to: **${amount} Gold Bars**.`, true);
+	},
+	'!setvipduration': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const days = parseInt(args[1]);
+		if (isNaN(days)) return send(sender.id, 'Usage: !setvipduration <days>', true);
+		state.vipDurationDays = days;
+		await syncState();
+		send(sender.id, `⏱️ VIP Duration set to: **${days} Days**.`, true);
+	},
+	'!vipinfo': async (sender, args, isDm) => {
+		const msg = `🏢 **VIP CLUB INFORMATION** 💎\n\n` +
+					`🚀 **How to Join:**\n` +
+					`• Tip the bot exactly **${state.vipPrice} Gold Bars** while in the room!\n\n` +
+					`💎 **Benefits:**\n` +
+					`• Access to exclusive VIP floors (f3, etc.)\n` +
+					`• VIP-only spawn point access\n` +
+					`• Status for **${state.vipDurationDays} days** per payment.\n\n` +
+					`✨ Tip the bot now to upgrade!`;
+		await send(sender.id, msg, isDm || true);
+	},
+	'!myvip': async (sender, args, isDm) => {
+		const uid = sender.actorId || sender.id;
+		const expiry = state.vipSubscriptions[uid];
+		if (!expiry || Date.now() > expiry) {
+			if (state.vipUserIds.includes(uid)) {
+				return send(sender.id, `💎 You are a **Permanent VIP**!`, isDm || true);
+			}
+			return send(sender.id, `❌ You don't have an active VIP subscription. Use !vipinfo to join!`, isDm || true);
+		}
+		
+		const daysLeft = Math.ceil((expiry - Date.now()) / (1000 * 60 * 60 * 24));
+		const expiryDate = new Date(expiry).toLocaleString();
+		send(sender.id, `💎 **YOUR VIP STATUS**\n✨ Days Left: **${daysLeft}**\n📅 Expires on: **${expiryDate}**`, isDm || true);
+	},
+	'!viplist': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		
+		const getName = (id) => {
+			const cached = state.usernameCache?.[id];
+			return cached ? `@${cached}` : `[ID: ${id}]`;
+		};
+
+		const manualVips = state.vipUserIds || [];
+		const subIds = Object.keys(state.vipSubscriptions).filter(id => state.vipSubscriptions[id] > Date.now());
+
+		// Create a unique set of all VIP IDs to avoid duplicates
+		const allVipIds = Array.from(new Set([...manualVips, ...subIds]));
+
+		if (allVipIds.length === 0) {
+			return send(sender.id, "❌ No active VIPs found.", true);
+		}
+
+		await send(sender.id, "📋 **ACTIVE VIP RECOGNITION** 💎", true);
+
+		let chunks = [];
+		for (const id of allVipIds) {
+			const pName = getName(id);
+			
+			if (manualVips.includes(id)) {
+				chunks.push(`• ${pName} - **Lifetime Access**`);
+			} else {
+				const expiry = new Date(state.vipSubscriptions[id]).toLocaleString();
+				chunks.push(`• ${pName} - Expires: ${expiry}`);
+			}
+		}
+
+		// Split chunks into groups of 5 to stay under the string length limit
+		for (let i = 0; i < chunks.length; i += 5) {
+			const subPart = chunks.slice(i, i + 5).join('\n');
+			await send(sender.id, subPart, true);
+			await delay(400); 
+		}
+	},
+	'!role': async (sender, args, isDm) => {
+		const mention = args[1];
+		const targetId = mention ? await resolveUserIdByMention(mention) : sender.id;
+		if (!targetId) return send(sender.id, 'User not found.', true);
+		
+		const getName = (id) => {
+			const cached = state.usernameCache?.[id];
+			return cached ? `@${cached}` : `[ID: ${id}]`;
+		};
+
+		const perms = await getRoomPermissions(targetId);
+		const isV = isVip(targetId);
+		
+		const pName = getName(targetId);
+		send(sender.id, `👤 **ROLES FOR ${pName}**\n🔧 Moderator: **${!!perms?.moderator}**\n🎨 Designer: **${!!perms?.designer}**\n💎 VIP: **${isV}**`, true);
+	},
+	'!info': async (sender, args, isDm) => {
+		const mention = args[1];
+		const targetId = mention ? await resolveUserIdByMention(mention) : sender.id;
+		if (!targetId) return send(sender.id, 'User not found.', true);
+
+		// Permissions Check: Only staff/owner can see info for others
+		if (targetId !== (sender.actorId || sender.id) && !(await hasModeratorRights(sender))) {
+			return send(sender.id, 'No permission to view others.', true);
+		}
+
+		const getName = (id) => {
+			const cached = state.usernameCache?.[id];
+			return cached ? `@${cached}` : `[ID: ${id}]`;
+		};
+
+		const perms = await getRoomPermissions(targetId);
+		const isV = isVip(targetId);
+		const pName = getName(targetId);
+		
+		let msg = `📜 **PLAYER INTEL: ${pName}**\n` +
+				  `🆔 ID: \`${targetId}\`\n` +
+				  `🔧 Mod: ${!!perms?.moderator} | 💎 VIP: ${isV}\n`;
+				  
+		const players = await bot.room.players.fetch();
+		const targetData = players.find(([u]) => u.id === targetId);
+		if (targetData?.[1]) {
+			const pos = targetData[1];
+			msg += `📍 Position: [${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}]`;
+		}
+		
+		send(sender.id, msg, true);
+	},
+	'!vipadd': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(sender.id, 'Usage: !vipadd @user [days]', true);
+		
+		const cleanMention = args[1]?.startsWith('@') ? args[1].substring(1) : args[1];
+		const days = parseInt(args[2]);
+		if (!isNaN(days)) {
+			// Add as subscription
+			const ms = days * 24 * 60 * 60 * 1000;
+			state.vipSubscriptions[targetId] = Date.now() + ms;
+			send(sender.id, `🎖️ Added **@${cleanMention}** as VIP for **${days} days**.`, true);
+		} else {
+			// Add as permanent
+			if (!state.vipUserIds.includes(targetId)) state.vipUserIds.push(targetId);
+			send(sender.id, `🎖️ Added **@${cleanMention}** as **Permanent VIP**.`, true);
+		}
+		await syncState();
+	},
+	'!vipdel': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(sender.id, 'Usage: !vipdel @user', true);
+		
+		state.vipUserIds = state.vipUserIds.filter(id => id !== targetId);
+		delete state.vipSubscriptions[targetId];
+		await syncState();
+		
+		send(sender.id, `🚫 Revoked VIP status from @${args[1]}.`, true);
+	},
+	'!botdance': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		startBotDance();
+		send(isDm ? sender.id : null, 'Bot dancing.', isDm);
+	},
+	'!stopbot': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		stopBotDance();
+		send(isDm ? sender.id : null, 'Bot stopped.', isDm);
+	},
+	'!setdur': async (sender, args, isDm) => {
+		const ms = parseInt(args[1]);
+		if (isNaN(ms) || ms < 500) return send(isDm ? sender.id : null, 'Usage: !setdur <ms>', isDm);
+		const rec = activeUserEmotes.get(sender.id);
+		if (!rec) return send(isDm ? sender.id : null, 'No active loop.', isDm);
+		loopEmoteForUser(sender.id, rec.emoteId, ms);
+	},
+	'!copy': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const targetId = (args[1]?.toLowerCase() === 'me' || !args[1]) ? sender.id : await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		const outfit = await bot.player.outfit.get(targetId);
+		if (outfit?.length) await bot.outfit.change(outfit);
+		send(isDm ? sender.id : null, 'Outfit copied!', isDm);
+	},
+	'!protect': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		addProtection(targetId);
+		send(isDm ? sender.id : null, `Protected ${args[1]}.`, isDm);
+	},
+	'!unprotect': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		removeProtection(targetId);
+		send(isDm ? sender.id : null, `Unprotected ${args[1]}.`, isDm);
+	},
+	'!prison': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		if (isProtected(targetId)) return send(isDm ? sender.id : null, 'User is protected.', isDm);
+		const mins = parseInt(args[2]) || 10;
+		await prisonUser(targetId, mins);
+		send(isDm ? sender.id : null, `Sent ${args[1]} to prison for ${mins}m.`, isDm);
+	},
+	'!release': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		if (!args[1]) return send(isDm ? sender.id : null, 'Usage: !release @user', isDm);
+		
+		const targetId = await resolveUserIdByMention(args[1]);
+		
+		if (targetId && state.globalPrison?.[targetId]) {
+			await releaseUser(targetId);
+			send(isDm ? sender.id : null, `🌟 Sentence cleared for ${args[1]}. They are now free to re-enter!`, isDm);
+		} else {
+			send(isDm ? sender.id : null, `User ${args[1]} is not currently in prison.`, isDm);
+		}
+	},
+	'!releaseall': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		await releaseAll();
+		send(isDm ? sender.id : null, 'Released everyone.', isDm);
+	},
+	'!move': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		const result = await moveUserToRoom(targetId, args[2]);
+		if (!result.ok) return send(isDm ? sender.id : null, result.error, isDm);
+		send(isDm ? sender.id : null, `Moved ${args[1]} to ${result.roomId}.`, isDm);
+	},
+	'!moveall': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const result = await moveAllToRoom(args[1]);
+		send(isDm ? sender.id : null, `Moved ${result.moved}. Skipped ${result.skipped}.`, isDm);
+	},
+	'!tp': async (sender, args, isDm) => {
+		const hasVip = isVip(sender.id);
+		if (!(await hasModeratorRights(sender.id)) && !hasVip) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		const pos = await getUserPosition(targetId);
+		await bot.player.teleport(sender.id, pos.x, pos.y, pos.z, pos.facing || 'FrontRight');
+	},
+	'!summon': async (sender, args, isDm) => {
+		const hasVip = isVip(sender.id);
+		if (!(await hasModeratorRights(sender.id)) && !hasVip) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		const pos = await getUserPosition(sender.id);
+		await bot.player.teleport(targetId, pos.x, pos.y, pos.z, pos.facing || 'FrontRight');
+	},
+
+	'!delfloor': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const roomState = await getRoomData(bot.roomId);
+		if (roomState.teleportPoints?.[args[1]]) {
+			delete roomState.teleportPoints[args[1]];
+			await syncRoomData(bot.roomId, roomState);
+			send(isDm ? sender.id : null, `Deleted floor ${args[1]}.`, isDm);
+		} else {
+			send(isDm ? sender.id : null, `Floor ${args[1]} not found.`, isDm);
+		}
+	},
+	'!wipefloors': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const roomState = await getRoomData(bot.roomId);
+		roomState.teleportPoints = {};
+		await syncRoomData(bot.roomId, roomState);
+		send(isDm ? sender.id : null, 'Wiped all custom floors for this room.', isDm);
+	},
+	'!floors': async (sender, args, isDm) => {
+		send(isDm ? sender.id : null, await formatTeleportPointsList(), isDm);
+	},
+	'!send': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const targetId = await resolveUserIdByMention(args[1]);
+		const roomState = await getRoomData(bot.roomId);
+		const point = roomState.teleportPoints?.[args[2]];
+		if (targetId && point) await bot.player.teleport(targetId, point.pos.x, point.pos.y, point.pos.z, point.pos.facing || 'FrontRight');
+	},
+	'!sendall': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const roomState = await getRoomData(bot.roomId);
+		const point = roomState.teleportPoints?.[args[1]];
+		if (!point) return;
+		const entries = await bot.room.players.fetch();
+		for (const [u] of entries) {
+			if (u.id && u.id !== botUserId) await bot.player.teleport(u.id, point.pos.x, point.pos.y, point.pos.z, point.pos.facing || 'FrontRight');
+		}
+		send(isDm ? sender.id : null, 'Sent everyone to point.', isDm);
+	},
+	'!party': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const emoteId = args[args.length - 1];
+		const mentions = args.slice(1, -1);
+		const ids = [];
+		for (const m of mentions) {
+			const uid = await resolveUserIdByMention(m);
+			if (uid && uid !== botUserId) ids.push(uid);
+		}
+		if (!ids.length) return;
+		if (activeDancePartyTimer) clearInterval(activeDancePartyTimer);
+		activeDanceParty = { emoteId: String(emoteId), userIds: [...new Set(ids)] };
+		activeDancePartyTimer = setInterval(() => {
+			for (const uid of activeDanceParty.userIds) bot.player.emote(uid, activeDanceParty.emoteId);
+		}, 2500);
+		send(isDm ? sender.id : null, `Party started!`, isDm);
+	},
+	'!partys': async (sender, args, isDm) => {
+		if (activeDancePartyTimer) {
+			clearInterval(activeDancePartyTimer);
+			activeDancePartyTimer = null;
+			send(isDm ? sender.id : null, 'Party stopped.', isDm);
+		}
+	},
+	'!protected': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const list = (state.protectedUserIds || []).map(getCachedUsername).join(', ');
+		send(isDm ? sender.id : null, list ? `Protected: ${list}` : 'None.', isDm);
+	},
+	'!sub': async (sender, args, isDm) => {
+		if (isDm !== 'inbox') return send(sender.id, 'Please use !sub in a Private DM to subscribe!', isDm);
+		if (!state.subscribers) state.subscribers = [];
+		if (state.subscribers.includes(sender.id)) return send(sender.id, "You're already subscribed!", isDm);
+		
+		state.subscribers.push(sender.id);
+		await syncState();
+		send(sender.id, WELCOME_TEMPLATE, isDm);
+	},
+	'!unsub': async (sender, args, isDm) => {
+		if (isDm !== 'inbox') return send(sender.id, 'Please use !unsub in a Private DM.', isDm);
+		if (!state.subscribers) state.subscribers = [];
+		
+		const idx = state.subscribers.indexOf(sender.id);
+		if (idx === -1) return send(sender.id, "You are not currently subscribed.", isDm);
+		
+		state.subscribers.splice(idx, 1);
+		await syncState();
+		send(sender.id, "Successfully unsubscribed. You will no longer receive inbox updates.", isDm);
+	},
+	'!broadcast': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const text = args.slice(1).join(' ');
+		if (!text) return send(isDm ? sender.id : null, 'Usage: !broadcast <message>', isDm);
+
+		const subs = state.subscribers || [];
+		if (!subs.length) return send(isDm ? sender.id : null, 'No subscribers found.', isDm);
+
+		let count = 0;
+		for (const subId of subs) {
+			try {
+				await bot.direct.send(subId, `📢 **EXCLUSIVE ANNOUNCEMENT**\n\n${text}`);
+				count++;
+				await delay(1000); // Prevent rate limits
+			} catch (e) {
+				console.warn(`Failed to message sub ${subId}: ${e.message}`);
+			}
+		}
+		send(isDm ? sender.id : null, `Broadcast sent to ${count} users.`, isDm);
+	},
+	'!subcounts': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const subs = state.subscribers || [];
+		send(isDm ? sender.id : null, `Total subscribers: ${subs.length}`, isDm);
+	},
+	'!inviteall': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		
+		const subs = state.subscribers || [];
+		if (!subs.length) return send(isDm ? sender.id : null, 'No subscribers found.', isDm);
+
+		let count = 0;
+		for (const subId of subs) {
+			try {
+				// 1. Send the invitation message as a standard DM
+				await bot.direct.send(subId, INVITE_MESSAGE);
+				// 2. Send the official Room Invite widget using the dedicated SDK method
+				await bot.invite.send(subId, bot.roomId);
+				count++;
+				await delay(1000); // Prevent rate limits
+			} catch (e) {
+				console.warn(`Failed to invite sub ${subId}: ${e.message}`);
+			}
+		}
+		send(isDm ? sender.id : null, `Invites sent to ${count} subscribers.`, isDm);
+	},
+	'!kick': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const ok = await withTarget(sender, args, '!kick', 'kick', isDm);
+		if (ok) send(isDm ? sender.id : null, `Kicked ${args[1]}.`, isDm);
+	},
+	'!mute': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const mins = parseInt(args[2]) || 60;
+		const ok = await withTarget(sender, args, '!mute', 'mute', isDm, 1, mins * 60);
+		if (ok) send(isDm ? sender.id : null, `Muted ${args[1]} for ${mins}m.`, isDm);
+	},
+	'!unmute': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const ok = await withTarget(sender, args, '!unmute', 'unmute', isDm);
+		if (ok) send(isDm ? sender.id : null, `Unmuted ${args[1]}.`, isDm);
+	},
+	'!ban': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const mins = parseInt(args[2]) || 60;
+		const ok = await withTarget(sender, args, '!ban', 'ban', isDm, 1, mins * 60);
+		if (ok) send(isDm ? sender.id : null, `Banned ${args[1]} for ${mins}m.`, isDm);
+	},
+	'!unban': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const ok = await withTarget(sender, args, '!unban', 'unban', isDm);
+		if (ok) send(isDm ? sender.id : null, `Unbanned ${args[1]}.`, isDm);
+	},
+	'!freeze': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const ok = await withTarget(sender, args, '!freeze', 'freeze', isDm);
+		if (ok) send(isDm ? sender.id : null, `Froze ${args[1]}.`, isDm);
+	},
+	'!unfreeze': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const ok = await withTarget(sender, args, '!unfreeze', 'unfreeze', isDm);
+		if (ok) send(isDm ? sender.id : null, `Unfroze ${args[1]}.`, isDm);
+	},
+	'!unfreezeall': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const entries = await bot.room.players.fetch();
+		let count = 0;
+		for (const [u] of entries) {
+			if (u.id && u.id !== botUserId && !isProtected(u.id)) {
+				await bot.player.moderateRoom({ user_id: u.id, moderation_action: 'unfreeze' });
+				count++;
+				await delay(300);
+			}
+		}
+		send(isDm ? sender.id : null, `Unfroze ${count} users.`, isDm);
+	},
+	'!void': async (sender, args, isDm) => {
+		if (!(await hasModeratorRights(sender.id))) return send(isDm ? sender.id : null, 'No permission.', isDm);
+		const ok = await withTarget(sender, args, '!void', 'void', isDm);
+		if (ok) send(isDm ? sender.id : null, `Voided ${args[1]}.`, isDm);
+	},
+	'!punch': async (sender, args, isDm) => {
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+
+		bot.player.emote(sender.id, EMOTE_MAP['punch'] || 'emoji-punch');
+		bot.player.emote(targetId, EMOTE_MAP['collapse'] || 'emote-death2');
+		send(isDm ? sender.id : null, `${sender.username} punched ${args[1]}!`, isDm);
+	},
+	'!cut': async (sender, args, isDm) => {
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+
+		bot.player.emote(sender.id, EMOTE_MAP['swordfight'] || 'emote-swordfight');
+		bot.player.emote(targetId, EMOTE_MAP['fallingapart'] || 'emote-apart');
+		send(isDm ? sender.id : null, `${sender.username} cut ${args[1]}!`, isDm);
+	},
+	'!bomb': async (sender, args, isDm) => {
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+
+		bot.player.emote(sender.id, EMOTE_MAP['energyball'] || 'emote-energyball');
+		bot.player.emote(targetId, EMOTE_MAP['faint'] || 'emote-fainting');
+		send(isDm ? sender.id : null, `${sender.username} threw a bomb at ${args[1]}!`, isDm);
+	},
+	'!rizz': async (sender, args, isDm) => {
+		const target = args[1] || sender.username;
+		let idx;
+		do {
+			idx = Math.floor(Math.random() * RIZZ_MESSAGES.length);
+		} while (idx === lastRizzIdx && RIZZ_MESSAGES.length > 1);
+		lastRizzIdx = idx;
+		const msg = RIZZ_MESSAGES[idx];
+		send(isDm ? sender.id : null, `💕 @${sender.username} to ${target}: ${msg}`, isDm);
+	},
+	'!roast': async (sender, args, isDm) => {
+		const target = args[1] || sender.username;
+		let idx;
+		do {
+			idx = Math.floor(Math.random() * ROAST_MESSAGES.length);
+		} while (idx === lastRoastIdx && ROAST_MESSAGES.length > 1);
+		lastRoastIdx = idx;
+		const msg = ROAST_MESSAGES[idx];
+		send(isDm ? sender.id : null, `🔥 @${sender.username} to ${target}: ${msg}`, isDm);
+	},
+	'!slap': async (sender, args, isDm) => {
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+
+		bot.player.emote(sender.id, EMOTE_MAP['slap'] || 'emote-slap');
+		bot.player.emote(targetId, EMOTE_MAP['stunned'] || 'emoji-dizzy');
+		send(isDm ? sender.id : null, `${sender.username} slapped ${args[1]}!`, isDm);
+	},
+	'!bans': (s, a, d) => send(d ? s.id : null, formatLogItems(state.logs?.bans), d),
+	'!kicks': (s, a, d) => send(d ? s.id : null, formatLogItems(state.logs?.kicks), d),
+	'!mutes': (s, a, d) => send(d ? s.id : null, formatLogItems(state.logs?.mutes), d),
+	'!punches': (s, a, d) => send(d ? s.id : null, formatLogItems(state.logs?.punches), d),
+	'!cuts': (s, a, d) => send(d ? s.id : null, formatLogItems(state.logs?.cuts), d),
+	'!voids': (s, a, d) => send(d ? s.id : null, formatLogItems(state.logs?.voids), d),
+	'!freezes': (s, a, d) => send(d ? s.id : null, formatLogItems(state.logs?.freezes), d),
+	'!unbans': (s, a, d) => send(d ? s.id : null, formatLogItems(state.logs?.unbans), d),
+	'!slaps': (s, a, d) => send(d ? s.id : null, formatLogItems(state.logs?.slaps), d),
+	'!fullc': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const targetId = await resolveUserIdByMention(args[1]);
+		if (targetId && !(state.fullControllerUserIds || []).includes(targetId)) {
+			state.fullControllerUserIds.push(targetId);
+			await syncState();
+			send(isDm ? sender.id : null, `Granted full control to ${args[1]}.`, isDm);
+		}
+	},
+	'!setspawn': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender.id))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const pos = await getUserPosition(sender.id);
+		const roomState = await getRoomData(bot.roomId);
+		roomState.spawnPos = { x: pos.x, y: pos.y, z: pos.z, facing: pos.facing || 'FrontRight' };
+		await syncRoomData(bot.roomId, roomState);
+		send(isDm ? sender.id : null, 'Spawn set.', isDm);
+	},
+	'!setvipspawn': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender.id))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+		const pos = await getUserPosition(sender.id);
+		const roomState = await getRoomData(bot.roomId);
+		roomState.vipSpawnPos = { x: pos.x, y: pos.y, z: pos.z, facing: pos.facing || 'FrontRight' };
+		await syncRoomData(bot.roomId, roomState);
+		send(isDm ? sender.id : null, 'VIP spawn set.', isDm);
+	},
+	'!whereami': async (sender, args, isDm) => {
+		const players = await bot.room.players.fetch();
+		const p = players.find(([u]) => u.id === sender.id);
+		if (p?.[1]) send(isDm ? sender.id : null, `Pos: ${p[1].x.toFixed(1)} ${p[1].y.toFixed(1)} ${p[1].z.toFixed(1)}`, isDm);
+	},
+	'!changeroom': async (sender, args, isDm) => {
+		if (!(await isOwnerOnly(sender))) return send(isDm ? sender.id : null, 'Owner only.', isDm);
+
+		// Store the REAL userId to match against the link when it arrives in inbox
+		state.waitingForInviteUser = sender.actorId || sender.id;
+		await syncState();
+
+		send(isDm ? sender.id : null, "Okay. Go to the new room, tap the Room Name -> 'Share' -> 'Copy Link', and paste the link to me here!", isDm);
+	}
+};
