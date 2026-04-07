@@ -1,10 +1,17 @@
 require('dotenv').config();
 const { Highrise, GatewayIntentBits, WebApi } = require('highrise.sdk');
+const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const connectDB = require('./db');
 const State = require('./models/State.model');
 const Room = require('./models/Room.model');
+
+// --- Monitoring Setup ---
+const app = express();
+app.use(express.json());
+const startTime = Date.now();
+const PORT = process.env.PORT || 3000;
 
 // Bot Configuration
 const settings = {
@@ -525,37 +532,6 @@ bot.on('roomModerate', (moderatorId, targetUserId, moderationType, duration) => 
 	if (action === 'cut') pushLog('cuts', common);
 	if (action === 'slap') pushLog('slaps', common);
 });
-
-// STARTUP WRAPPER
-(async () => {
-	try {
-		// 1. Connect to Database
-		await connectDB();
-		
-		// 2. Fetch (and potentially migrate) state
-		await fetchState();
-
-		// 3. Login to Highrise
-		bot.login(settings.token, settings.room);
-
-		// 4. Re-arm Prison Timers (Global State)
-		if (state.globalPrison) {
-			for (const [uid, rec] of Object.entries(state.globalPrison)) {
-				const remaining = Math.max(0, rec.until - Date.now());
-				if (remaining > 0) {
-					const t = setTimeout(() => releaseUser(uid), remaining);
-					activePrisonTimers.set(uid, t);
-				} else {
-					delete state.globalPrison[uid];
-					await syncState();
-				}
-			}
-		}
-	} catch (err) {
-		console.error('[STARTUP FATAL] Failed to initialize bot:', err.message);
-		process.exit(1);
-	}
-})();
 
 // -----------------------
 // Command Router (minimal)
@@ -2232,3 +2208,137 @@ const COMMAND_DISPATCHER = {
 		send(isDm ? sender.id : null, "Okay. Go to the new room, tap the Room Name -> 'Share' -> 'Copy Link', and paste the link to me here!", isDm);
 	}
 };
+
+// --- Web Server & Status Dashboard ---
+app.get('/', (req, res) => {
+	const uptime = Math.floor((Date.now() - startTime) / 1000);
+	const hours = Math.floor(uptime / 3600);
+	const minutes = Math.floor((uptime % 3600) / 60);
+	const seconds = uptime % 60;
+
+	res.send(`
+		<!DOCTYPE html>
+		<html lang="en">
+		<head>
+			<meta charset="UTF-8">
+			<meta name="viewport" content="width=device-width, initial-scale=1.0">
+			<title>MCD Buddy Status</title>
+			<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;700&display=swap" rel="stylesheet">
+			<style>
+				:root {
+					--bg: #0f172a;
+					--card: #1e293b;
+					--primary: #f59e0b;
+					--accent: #ef4444;
+					--text: #f8fafc;
+					--text-dim: #94a3b8;
+                    --success: #10b981;
+				}
+				body {
+					font-family: 'Outfit', sans-serif;
+					background-color: var(--bg);
+					color: var(--text);
+					display: flex;
+					align-items: center;
+					justify-content: center;
+					min-height: 100vh;
+					margin: 0;
+					overflow: hidden;
+				}
+				.status-card {
+					background: var(--card);
+					padding: 2.5rem;
+					border-radius: 20px;
+					box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
+					border-top: 5px solid var(--primary);
+					max-width: 450px;
+					width: 100%;
+					text-align: center;
+				}
+				h1 { margin: 0 0 0.5rem; color: var(--primary); font-size: 2rem; }
+				.subtitle { color: var(--text-dim); margin-bottom: 2rem; font-size: 0.9rem; letter-spacing: 1px; text-transform: uppercase; }
+				.stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 2rem; }
+				.stat-item { background: rgba(15, 23, 42, 0.5); padding: 1rem; border-radius: 12px; border: 1px solid rgba(255,255,255,0.05); }
+				.stat-label { font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase; margin-bottom: 0.25rem; }
+				.stat-value { font-size: 1.1rem; font-weight: 700; color: var(--success); }
+				.footer { font-size: 0.8rem; color: var(--text-dim); border-top: 1px solid rgba(255,255,255,0.05); padding-top: 1.5rem; }
+				.icon { font-size: 2.5rem; display: block; margin-bottom: 1rem; }
+			</style>
+		</head>
+		<body>
+			<div class="status-card">
+				<span class="icon">🍔</span>
+				<h1>MCD BUDDY</h1>
+				<div class="subtitle">Operations Dashboard</div>
+				<div class="stats-grid">
+					<div class="stat-item">
+						<div class="stat-label">STATUS</div>
+						<div class="stat-value">ONLINE</div>
+					</div>
+					<div class="stat-item">
+						<div class="stat-label">UPTIME</div>
+						<div class="stat-value">${hours}h ${minutes}m ${seconds}s</div>
+					</div>
+					<div class="stat-item">
+						<div class="stat-label">DATABASE</div>
+						<div class="stat-value">CONNECTED</div>
+					</div>
+					<div class="stat-item">
+						<div class="stat-label">PLATFORM</div>
+						<div class="stat-value">RENDER</div>
+					</div>
+				</div>
+				<div class="footer">
+					Serving the community with passion. 🍟✨
+				</div>
+			</div>
+		</body>
+		</html>
+	`);
+});
+
+// --- Webhook Receiver ---
+app.post('/webhook', (req, res) => {
+	console.log('[WEBHOOK] Signal Received:', JSON.stringify(req.body, null, 2));
+	// Future-proofing: Here you can trigger bot events based on external webhooks
+	res.status(200).send({ status: 'success', message: 'Webhook signal received' });
+});
+
+// --- Initialization & Boot ---
+(async () => {
+    try {
+        // 1. Connect MongoDB
+        await connectDB();
+
+        // 2. Fetch (and potentially migrate) state
+        await fetchState();
+
+        // 3. Start Web Server (Dashboard)
+        app.listen(PORT, () => {
+            console.log(`[SERVER] Monitoring Dashboard live on port ${PORT}`);
+        });
+
+        // 4. Re-arm Prison Timers (from DB state)
+        if (state.globalPrison) {
+            console.log(`[PRISON] Re-arming ${Object.keys(state.globalPrison).length} active sentences...`);
+            for (const [uid, rec] of Object.entries(state.globalPrison)) {
+                const remaining = Math.max(0, rec.until - Date.now());
+                if (remaining > 0) {
+                    const t = setTimeout(() => releaseUser(uid), remaining);
+                    activePrisonTimers.set(uid, t);
+                } else {
+                    delete state.globalPrison[uid];
+                    await syncState();
+                }
+            }
+        }
+
+        // 5. Connect Highrise Bot
+        console.log('[BOT] Initializing Highrise connection...');
+        bot.login(settings.token, settings.room);
+
+    } catch (err) {
+        console.error('[STARTUP FATAL] Failed to initialize bot:', err.message);
+        process.exit(1);
+    }
+})();
