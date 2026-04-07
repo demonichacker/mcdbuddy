@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { Highrise, GatewayIntentBits, WebApi } = require('highrise.sdk');
 const express = require('express');
+const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
 const connectDB = require('./db');
@@ -2303,6 +2304,27 @@ app.post('/webhook', (req, res) => {
 	// Future-proofing: Here you can trigger bot events based on external webhooks
 	res.status(200).send({ status: 'success', message: 'Webhook signal received' });
 });
+
+// --- Graceful Shutdown ---
+async function shutdown(signal) {
+    console.log(`\n[SHUTDOWN] Received ${signal}. Closing connections...`);
+    try {
+        await syncState();
+        bot.logout();
+        console.log('[SHUTDOWN] Bot logged out.');
+        if (mongoose.connection.readyState !== 0) {
+            await mongoose.disconnect();
+            console.log('[SHUTDOWN] MongoDB disconnected.');
+        }
+        process.exit(0);
+    } catch (err) {
+        console.error('[SHUTDOWN ERROR]', err.message);
+        process.exit(1);
+    }
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 // --- Initialization & Boot ---
 (async () => {
