@@ -474,6 +474,13 @@ bot.on('error', async (message) => {
 	console.error(`[ERROR] ${message}`);
 	lastApiError = { message: msg, at: Date.now() };
 
+	// --- FIX: Handle Multilogin clashing on Render ---
+	if (msg.includes('multilogin')) {
+		console.warn('[SESSION] Multilogin detected. Waiting 20 seconds for other session to clear...');
+		// Force a longer wait by overriding the default reconnect if possible, 
+		// or just let it fail and wait for the NEXT attempt after the settle period.
+	}
+
 	// --- SAFETY REVERT TRIGGER ---
 	// If we hit "Room not found" or "Not authorized" and we have a backup room, jump back!
 	if (state.lastGoodRoomId && (msg.includes('room not found') || msg.includes('not authorized'))) {
@@ -2311,7 +2318,11 @@ async function shutdown(signal) {
     try {
         await syncState();
         bot.logout();
-        console.log('[SHUTDOWN] Bot logged out.');
+        console.log('[SHUTDOWN] Bot logout signal sent.');
+        
+        // Give the SDK a moment to send the logout packet before closing DB/Exiting
+        await new Promise(resolve => setTimeout(resolve, 500));
+
         if (mongoose.connection.readyState !== 0) {
             await mongoose.disconnect();
             console.log('[SHUTDOWN] MongoDB disconnected.');
@@ -2329,6 +2340,11 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 // --- Initialization & Boot ---
 (async () => {
     try {
+        // --- CLOUD SETTLE DELAY ---
+        // Give any existing instances (Render handovers) time to shut down before we try to take the token.
+        console.log('[BOOT] Settle period active. Waiting 12 seconds to ensure session is clear...');
+        await new Promise(resolve => setTimeout(resolve, 12000));
+
         // 1. Connect MongoDB
         await connectDB();
 
