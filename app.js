@@ -1144,7 +1144,11 @@ const EMOTE_MAP = {
 	"stormmood": "emote-rainstruck-fail",
 	"bloomflutter": "emote-bloomify-pose1",
 	"bloomcharm": "emote-bloomify-pose2",
-	"bloomradiance": "emote-bloomify-pose3"
+	"bloomradiance": "emote-bloomify-pose3",
+	"midnightpose": "emote-pose-goth1",
+	"chaoscutie": "emote-punkandlaces-pose1",
+	"rebeldarling": "emote-punkandlaces-pose2",
+	"sweettease": "emote-punkandlaces-pose3"
 };
 const EMOTE_KEYS = Object.keys(EMOTE_MAP);
 const EMOTE_LIST = Object.values(EMOTE_MAP);
@@ -1190,7 +1194,11 @@ const EMOTE_DURATIONS = {
 	'emote-rainstruck-fail': 10000,
 	'emote-bloomify-pose1': 3000,
 	'emote-bloomify-pose2': 3000,
-	'emote-bloomify-pose3': 3000
+	'emote-bloomify-pose3': 3000,
+	'emote-pose-goth1': 4000,
+	'emote-punkandlaces-pose1': 4000,
+	'emote-punkandlaces-pose2': 4000,
+	'emote-punkandlaces-pose3': 4000
 };
 
 const cooldowns = new Map();
