@@ -1148,7 +1148,11 @@ const EMOTE_MAP = {
 	"midnightpose": "emote-pose-goth1",
 	"chaoscutie": "emote-punkandlaces-pose1",
 	"rebeldarling": "emote-punkandlaces-pose2",
-	"sweettease": "emote-punkandlaces-pose3"
+	"sweettease": "emote-punkandlaces-pose3",
+	"sweetstrike": "emote-sugarbite-pose1",
+	"sweetfix": "emote-sugarbite-pose2",
+	"sweetlure": "emote-sugarbite-pose3",
+	"smooch": "emote-kissing"
 };
 const EMOTE_KEYS = Object.keys(EMOTE_MAP);
 const EMOTE_LIST = Object.values(EMOTE_MAP);
@@ -1198,7 +1202,11 @@ const EMOTE_DURATIONS = {
 	'emote-pose-goth1': 4000,
 	'emote-punkandlaces-pose1': 4000,
 	'emote-punkandlaces-pose2': 4000,
-	'emote-punkandlaces-pose3': 4000
+	'emote-punkandlaces-pose3': 4000,
+	'emote-sugarbite-pose1': 15000,
+	'emote-sugarbite-pose2': 15000,
+	'emote-sugarbite-pose3': 15000,
+	'emote-kissing': 5000
 };
 
 const cooldowns = new Map();
