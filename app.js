@@ -1153,7 +1153,7 @@ const EMOTE_MAP = {
 	"sweetfix": "emote-sugarbite-pose2",
 	"sweetlure": "emote-sugarbite-pose3",
 	"smooch": "emote-kissing",
-	"repose": "emote-kissing"
+	"repose": "sit-relaxed"
 };
 const EMOTE_KEYS = Object.keys(EMOTE_MAP);
 const EMOTE_LIST = Object.values(EMOTE_MAP);
