@@ -467,9 +467,9 @@ bot.on('playerLeave', (user) => {
 bot.on('error', async (message) => {
 	const msg = String(message || '').toLowerCase();
 	
-	// --- FIX: Suppress "Target user not in room" logs ---
+	// --- FIX: Suppress "User not in room" logs ---
 	// This error is a common SDK race condition and isn't usually critical.
-	if (msg.includes('target user not in room')) return;
+	if (msg.includes('user not in room')) return;
 
 	console.error(`[ERROR] ${message}`);
 	lastApiError = { message: msg, at: Date.now() };
@@ -1238,10 +1238,24 @@ function loopEmoteForUser(userId, emoteId, customMs = null) {
 	const ms = customMs || EMOTE_DURATIONS[emoteId] || 3500;
 
 	// Recursive trigger function
-	const run = () => {
-		bot.player.emote(userId, emoteId);
-		const timer = setTimeout(run, ms);
-		activeUserEmotes.set(userId, { timer, emoteId, ms });
+	const run = async () => {
+        try {
+            // VERIFICATION: Is the user still physically in the room?
+            const players = await bot.room.players.fetch();
+            const isInRoom = players.some(([u]) => u.id === userId);
+            
+            if (!isInRoom) {
+                console.log(`[CLEANUP] Stop looping emote for ${userId} (User left room)`);
+                return stopEmoteForUser(userId);
+            }
+
+            bot.player.emote(userId, emoteId);
+            const timer = setTimeout(run, ms);
+            activeUserEmotes.set(userId, { timer, emoteId, ms });
+        } catch (e) {
+            console.error(`[ERROR] Emote loop for ${userId} failed:`, e.message);
+            stopEmoteForUser(userId);
+        }
 	};
 
 	run();
@@ -1252,8 +1266,8 @@ function stopEmoteForUser(userId) {
 		const rec = activeUserEmotes.get(userId);
 		clearTimeout(rec.timer);
 		activeUserEmotes.delete(userId);
-		// Optionally send "0" to stop the animation immediately (best-effort)
-		bot.player.emote(userId, '0');
+		// Best-effort: Stop the animation if they are still there
+		try { bot.player.emote(userId, '0'); } catch (e) {}
 	}
 }
 
