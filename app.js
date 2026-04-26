@@ -2383,8 +2383,8 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
     try {
         // --- CLOUD SETTLE DELAY ---
         // Give any existing instances (Render handovers) time to shut down before we try to take the token.
-        console.log('[BOOT] Settle period active. Waiting 12 seconds to ensure session is clear...');
-        await new Promise(resolve => setTimeout(resolve, 12000));
+        console.log('[BOOT] Settle period active. Waiting 25 seconds to ensure session is clear...');
+        await new Promise(resolve => setTimeout(resolve, 25000));
 
         // 1. Connect MongoDB
         await connectDB();
