@@ -2159,6 +2159,7 @@ const COMMAND_DISPATCHER = {
 	'!punch': async (sender, args, isDm) => {
 		const targetId = await resolveUserIdByMention(args[1]);
 		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		if (isProtected(targetId)) return send(isDm ? sender.id : null, 'User is protected.', isDm);
 
 		bot.player.emote(sender.id, EMOTE_MAP['punch'] || 'emoji-punch');
 		bot.player.emote(targetId, EMOTE_MAP['collapse'] || 'emote-death2');
@@ -2167,6 +2168,7 @@ const COMMAND_DISPATCHER = {
 	'!cut': async (sender, args, isDm) => {
 		const targetId = await resolveUserIdByMention(args[1]);
 		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		if (isProtected(targetId)) return send(isDm ? sender.id : null, 'User is protected.', isDm);
 
 		bot.player.emote(sender.id, EMOTE_MAP['swordfight'] || 'emote-swordfight');
 		bot.player.emote(targetId, EMOTE_MAP['fallingapart'] || 'emote-apart');
@@ -2175,6 +2177,7 @@ const COMMAND_DISPATCHER = {
 	'!bomb': async (sender, args, isDm) => {
 		const targetId = await resolveUserIdByMention(args[1]);
 		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		if (isProtected(targetId)) return send(isDm ? sender.id : null, 'User is protected.', isDm);
 
 		bot.player.emote(sender.id, EMOTE_MAP['energyball'] || 'emote-energyball');
 		bot.player.emote(targetId, EMOTE_MAP['faint'] || 'emote-fainting');
@@ -2192,6 +2195,10 @@ const COMMAND_DISPATCHER = {
 	},
 	'!roast': async (sender, args, isDm) => {
 		const target = args[1] || sender.username;
+		const targetId = await resolveUserIdByMention(target);
+		
+		if (targetId && isProtected(targetId)) return send(isDm ? sender.id : null, 'User is protected.', isDm);
+
 		let idx;
 		do {
 			idx = Math.floor(Math.random() * ROAST_MESSAGES.length);
@@ -2203,6 +2210,7 @@ const COMMAND_DISPATCHER = {
 	'!slap': async (sender, args, isDm) => {
 		const targetId = await resolveUserIdByMention(args[1]);
 		if (!targetId) return send(isDm ? sender.id : null, 'User not found.', isDm);
+		if (isProtected(targetId)) return send(isDm ? sender.id : null, 'User is protected.', isDm);
 
 		bot.player.emote(sender.id, EMOTE_MAP['slap'] || 'emote-slap');
 		bot.player.emote(targetId, EMOTE_MAP['stunned'] || 'emoji-dizzy');
